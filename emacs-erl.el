@@ -75,7 +75,7 @@
 ;; version number (131).
 (defconst erl-ext-version 131)
 
-(defconst erl-tag (make-symbol "__erl-tag"))
+(defconst erl-tag (make-symbol "erl-tag"))
 
 (defun erl-read ()
   (when (eq (char-after) 80) ; Compressed term
@@ -101,6 +101,13 @@
       (98 ; INTEGER_EXT
        (let ((u (read4)))
          (- (logand u #x7fffffff) (logand u #x80000000))))
+
+      (88 ; NEW_PID_EXT
+       (let* ((node (erl-read))
+              (id (read4))
+              (serial (read4))
+              (creation (read4)))
+         (vector erl-tag 'pid node id serial creation)))
 
       ((or (and 104 (let n (progn (forward-char) (char-before)))) ; SMALL_TUPLE_EXT
            (and 105 (let n (read4)))) ; LARGE_TUPLE_EXT
@@ -144,11 +151,11 @@
     (pcase term
       ((and (pred integerp) i)
        (cond
-        ((<= 0 i #xff)
-         (insert 97 i)) ; SMALL_INTEGER_EXT
-        ((<= (- #x7fffffff) i #x7fffffff)
+        ((<= 0 i #xff) (insert 97 i)) ; SMALL_INTEGER_EXT
+        ((<= (- #x80000000) i #x7fffffff)
          (insert 98) ; INTEGER_EXT
-         (write4 i))))
+         (write4 i))
+        (t (error "TODO Write bignum"))))
       ((and (pred vectorp) (guard (eq (aref term 0) erl-tag)))
        (pcase (aref term 1)
          ('pid
@@ -226,11 +233,10 @@
         (let* ((saved-s (process-get proc 'buf))
                (s (if (string= saved-s "") string (concat saved-s string)))
                (s-len (string-bytes s)) length)
-          (if (and (>= s-len 2) (<= (setq len (+ 2 (erl--read-uint 2 s 0))) s-len))
-              (progn (process-put proc 'buf (substring s len))
-                     (substring s 2 len))
-            (process-put proc 'buf s)
-            nil)))
+          (if (or (< s-len 2) (> (setq len (+ 2 (erl--read-uint 2 s 0))) s-len))
+              (progn (process-put proc 'buf s) nil)
+            (process-put proc 'buf (substring s len))
+            (substring s 2 len))))
        (recv-status
         (proc string)
         (when-let (s (get-msg proc string))
@@ -248,7 +254,7 @@
             ;; TODO alive and case 3B)
             (t (error "Unknown status: %S" s)))
            ;; proc "")))
-           proc (process-get proc 'buf))))
+           proc (prog1 (process-get proc 'buf) (process-put proc 'buf "")))))
        (recv-challenge
         (proc string)
         (let* ((alist (bindat-unpack erl-recv-challenge-bindat-spec string))
@@ -273,13 +279,36 @@
           (set-process-filter proc #'connected-filter)))
        (connected-filter
         (proc string)
-        (message "Received: %S" string)
-        ;; Zero length messages are some kind of heartbeat?
-        (when (string= string "\0\0\0\0") (process-send-string proc string))))
+        (let* ((saved-s (process-get proc 'buf))
+               (s (if (string= saved-s "") string (concat saved-s string)))
+               (s-len (string-bytes s)) length)
+          (if (or (< s-len 4) (> (setq length (+ 4 (erl--read-uint 4 s 0))) s-len))
+              (process-put proc 'buf s)
+            (setq string (substring s 4 length))
+            (if (string= string "")
+                (process-send-string proc "\0\0\0\0") ; Zero length heartbeat
+              (message "Received: %S" string)
+              (cl-assert (eq (aref string 0) 112)) ; Check that type is pass through
+              (with-temp-buffer
+                (set-buffer-multibyte nil)
+                (insert string)
+                (goto-char (1+ (point-min)))
+                (let (control-msg msg)
+                  (cl-assert (eq (char-after) erl-ext-version))
+                  (forward-char)
+                  (setq control-msg (erl-read))
+                  (cl-assert (eq (char-after) erl-ext-version))
+                  (forward-char)
+                  (setq msg (erl-read))
+                  (message "Parsed: %S" (cons control-msg msg)))))
+
+            (process-put proc 'buf "")
+            (connected-filter proc (substring s length))))))
     (let ((proc (make-network-process
                  :name "erl-emacs" :host 'local :service port
                  :coding 'raw-text :filter-multibyte nil :filter #'recv-status
-                 :sentinel (lambda (proc string) (message "Sentinel: %S" string))))
+                 :sentinel (lambda (proc string) (message "Sentinel: %S" string))
+                 :plist (list 'buf "")))
           (flags
            (eval-when-compile
              (erl--write-uint
@@ -294,6 +323,7 @@
                  #x10000 ; DFLAG_UTF8_ATOMS
                  #x20000 ; DFLAG_MAP_TAG
                  #x40000 ; DFLAG_BIG_CREATION
+                 #x80000 ; DFLAG_SEND_SENDER
                  #x1000000 ; DFLAG_HANDSHAKE_23
                  #x2000000 ; DFLAG_UNLINK_ID
                  (ash 1 33) ; DFLAG_NAME_ME
@@ -312,15 +342,73 @@
 (setq erl-conn (erl-conn 42761 "IYQBVJUETYMWBBGPADPN"))
 (delete-process erl-conn)
 
-(defun erl-self (conn)
+(cl-defstruct (erl-process (:type vector) (:constructor nil)
+                           (:copier nil) (:predicate nil))
+  (id (:read-only t)) (cond-var (:read-only t)) mailbox)
+
+(defvar erl--current-process)
+
+(defvar erl--processes (make-hash-table :test 'eql))
+
+(defmacro erl-spawn (&rest body)
+  `(let* ((id (hash-table-count erl--processes)) ; TODO Monotonically increasing
+          (mutex (make-mutex))
+          (cond-var (make-condition-variable mutex))
+          (process (vector id cond-var ()))
+          (thread
+           (make-thread
+            (lambda ()
+              (let ((erl--current-process process))
+                (unwind-protect
+                    (progn ,@body)
+                  (remhash (erl-process-id erl--current-process) erl--processes)))))))
+     (puthash id process erl--processes)))
+
+(defmacro erl-receive (&rest arms)
+  `(pcase
+       (with-mutex (condition-mutex (erl-process-cond-var erl--current-process))
+         (while (null (erl-process-mailbox erl--current-process))
+           (condition-wait (erl-process-cond-var erl--current-process)))
+         (erl-process-mailbox erl--current-process))
+     ,@arms))
+
+(defun erl-send (process expr)
+  (with-mutex (condition-mutex (erl-process-cond-var process))
+    (push expr (erl-process-mailbox process))
+    (condition-notify (erl-process-cond-var process))))
+
+(erl-spawn
+ (erl-receive
+  (x (message "Received %S!" x)))
+ (message "After!"))
+
+(cl-loop for process being the hash-values of erl--processes do
+         (erl-send process 1337))
+
+(defun erl-make-pid (conn id)
   (let ((name (process-get conn 'name))
         (creation (process-get conn 'creation))
-        (id 0) (serial 0))
+        (serial 0))
     `[,erl-tag pid ,name ,id ,serial ,creation]))
+
+(defun erl-rpc (conn module function &rest args)
+  (let* ((name-b (process-get conn 'name-b))
+         (pid (erl-self conn))
+         (control-msg (erl-term-to-binary `[6 ,pid nil rex])) ; REG_SEND
+         (msg (erl-term-to-binary
+               ;; {Who, {call, M, F, A, GroupLeader}}
+               `[,pid [call ,module ,function ,args ,pid]])))
+    (process-send-string
+     conn
+     (concat
+      (erl--write-uint 4 (+ 1 (string-bytes control-msg) (string-bytes msg)))
+      [112] ; Pass through
+      control-msg
+      msg))))
 
 ;; Try sending a msg
 (let* ((name-b (process-get erl-conn 'name-b))
-       (pid (erl-self erl-conn))
+       (pid (erl-make-pid erl-conn 0))
        (control-msg (erl-term-to-binary
                      ;; `[23 ,(erl-self erl-conn) [rex ,name-b] #xbb])) ; SEND_SENDER_TT
                      `[6 ,pid nil rex]
@@ -349,17 +437,19 @@
   (should (equal (erl-binary-to-term 131 104 3 97 1 97 2 97 3) [1 2 3]))
   (should (eq (erl-binary-to-term 131 106) ()))
 
-  (should (eq (erl-binary-to-term 131 98 255 255 255 255) -1))
+  (should (eq (erl-binary-to-term 131 98 255 255 255 255) -1)))
 
+(ert-deftest erl-write-test ()
   (should (equal (erl-term-to-binary -1) "\203b\377\377\377\377"))
+  (should (equal (erl-term-to-binary (- #x80000000)) "\203b\200\0\0\0"))
 
   (should
    (equal 
-"\203hwrex"
     (erl-term-to-binary [rex "hej"])
-"\203hd rexk hej"
-    (unibyte-string 131 104 2 100 0 3 114 101 120 107 0 3 104 101 106)))
+"\203h\C-bd\0\C-crexk\0\C-chej"
+    ;; (unibyte-string 131 104 2 100 0 3 114 101 120 107 0 3 104 101 106)
+    )))
 
-
+(ert-deftest erl-roundtrip-test ()
   (should (let ((x [rex "hej"]))
             (equal (erl-binary-to-term (erl-term-to-binary x)) x))))
