@@ -26,12 +26,6 @@
 (defun epmd-port-please (name cb)
   "Get the distribution port of the node NAME."
   (let* ((epmd-port 4369)
-         (port-please2-req-bindat-spec
-          (bindat-type
-            :pack-var s
-            (length uint 16 :pack-val (1+ (string-bytes s)))
-            (tag u8 :pack-val 122)
-            (node-name str (1- length) :pack-val s)))
          (port2-resp-bindat-spec
           (bindat-type
             (tag u8 :pack-val 119)
@@ -57,7 +51,10 @@
                (funcall cb (if (/= result 0) (cons 'error result)
                              (bindat-get-field alist 'data 'portno)))))
            :sentinel (lambda (proc event) (funcall cb (cons 'error event))))))
-    (process-send-string proc (bindat-pack port-please2-req-bindat-spec name))
+    (let ((s (concat (erl--write-uint 2 (1+ (string-bytes name)))
+                     [122] ; PORT_PLEASE2_REQ
+                     name)))
+    (process-send-string proc s))
     proc))
 
 (defun epmd-port-please-sync (name)
@@ -156,20 +153,12 @@
          (insert 98) ; INTEGER_EXT
          (write4 i))
         (t (error "TODO Write bignum"))))
-      ((and (pred vectorp) (guard (eq (aref term 0) erl-tag)))
-       (pcase (aref term 1)
-         ('pid
-          (let ((node (aref term 2))
-                (id (aref term 3))
-                (serial (aref term 4))
-                (creation (aref term 5)))
-            (insert 88) ; NEW_PID_EXT
-            (erl-write node)
-            (write4 id)
-            (write4 serial)
-            (write4 creation)))
-         )
-       )
+      (`[,(pred (eq erl-tag)) pid ,node ,id ,serial ,creation]
+       (insert 88) ; NEW_PID_EXT
+       (erl-write node)
+       (write4 id)
+       (write4 serial)
+       (write4 creation))
       ((pred vectorp)
        (if (<= (length term) #xff) (insert 104 (length term)) ; SMALL_TUPLE_EXT
          (insert 105) ; LARGE_TUPLE_EXT
@@ -209,6 +198,59 @@
     (insert erl-ext-version)
     (erl-write term)
     (buffer-substring-no-properties (point-min) (point-max))))
+
+;;; Erlang-ish process library
+
+(cl-defstruct (erl-process (:type vector) (:constructor nil)
+                           (:copier nil) (:predicate nil))
+  (id (:read-only t)) (cond-var (:read-only t)) mailbox)
+
+(defvar erl--processes (make-hash-table :test 'eql)
+  "Map of PID:s to processes.")
+(defvar erl--next-pid 0)
+
+;; Process-local variables
+(defvar erl--self "The current process.")
+(defvar erl--mailbox "The private mailbox of the current process.")
+
+(defmacro erl-spawn (&rest body)
+  `(let* ((id (cl-incf erl--next-pid))
+          (mutex (make-mutex))
+          (cond-var (make-condition-variable mutex))
+          (process (vector id cond-var ()))
+          (fun (lambda ()
+                 (let ((erl--self process) erl--mailbox)
+                   (unwind-protect (progn ,@body)
+                     (remhash (erl-process-id erl--self) erl--processes)))))
+          (thread (make-thread fun)))
+     (puthash id process erl--processes)))
+
+;; TODO Selective receive
+(defmacro erl-receive (&rest arms)
+  `(pcase
+       (progn
+         (unless erl--mailbox
+           (with-mutex (condition-mutex (erl-process-cond-var erl--self))
+             (while (null (erl-process-mailbox erl--self))
+               (condition-wait (erl-process-cond-var erl--self)))
+             (setf erl--mailbox (nreverse (erl-process-mailbox erl--self))
+                   (erl-process-mailbox erl--self) ())))
+         (pop erl--mailbox))
+     ,@arms))
+
+(defun erl-send (pid expr)
+  (when-let (process (gethash pid erl--processes))
+    (with-mutex (condition-mutex (erl-process-cond-var process))
+      (push expr (erl-process-mailbox process))
+      (condition-notify (erl-process-cond-var process)))))
+
+(erl-spawn
+ (erl-receive
+  (x (message "Received %S!" x)))
+ (message "After!"))
+
+(cl-loop for process being the hash-values of erl--processes do
+         (erl-send (erl-process-id process) 1337))
 
 ;;; Erlang Distribution Protocol
 
@@ -293,14 +335,19 @@
                 (set-buffer-multibyte nil)
                 (insert string)
                 (goto-char (1+ (point-min)))
-                (let (control-msg msg)
-                  (cl-assert (eq (char-after) erl-ext-version))
-                  (forward-char)
-                  (setq control-msg (erl-read))
-                  (cl-assert (eq (char-after) erl-ext-version))
-                  (forward-char)
-                  (setq msg (erl-read))
-                  (message "Parsed: %S" (cons control-msg msg)))))
+                (let ((control-msg
+                       (progn (cl-assert (eq (char-after) erl-ext-version))
+                              (forward-char)
+                              (erl-read)))
+                      (msg (progn (cl-assert (eq (char-after) erl-ext-version))
+                                  (forward-char)
+                                  (erl-read))))
+                  (message "Parsed: %S" (cons control-msg msg))
+
+                  (pcase control-msg
+                    ;; SEND_SENDER
+                    (`[22 ,_from-pid [,_ pid ,_name ,to-pid ,_serial ,_creation]]
+                     (erl-send to-pid msg))))))
 
             (process-put proc 'buf "")
             (connected-filter proc (substring s length))))))
@@ -342,53 +389,12 @@
 (setq erl-conn (erl-conn 42761 "IYQBVJUETYMWBBGPADPN"))
 (delete-process erl-conn)
 
-(cl-defstruct (erl-process (:type vector) (:constructor nil)
-                           (:copier nil) (:predicate nil))
-  (id (:read-only t)) (cond-var (:read-only t)) mailbox)
-
-(defvar erl--current-process)
-
-(defvar erl--processes (make-hash-table :test 'eql))
-
-(defmacro erl-spawn (&rest body)
-  `(let* ((id (hash-table-count erl--processes)) ; TODO Monotonically increasing
-          (mutex (make-mutex))
-          (cond-var (make-condition-variable mutex))
-          (process (vector id cond-var ()))
-          (thread
-           (make-thread
-            (lambda ()
-              (let ((erl--current-process process))
-                (unwind-protect
-                    (progn ,@body)
-                  (remhash (erl-process-id erl--current-process) erl--processes)))))))
-     (puthash id process erl--processes)))
-
-(defmacro erl-receive (&rest arms)
-  `(pcase
-       (with-mutex (condition-mutex (erl-process-cond-var erl--current-process))
-         (while (null (erl-process-mailbox erl--current-process))
-           (condition-wait (erl-process-cond-var erl--current-process)))
-         (erl-process-mailbox erl--current-process))
-     ,@arms))
-
-(defun erl-send (process expr)
-  (with-mutex (condition-mutex (erl-process-cond-var process))
-    (push expr (erl-process-mailbox process))
-    (condition-notify (erl-process-cond-var process))))
-
-(erl-spawn
- (erl-receive
-  (x (message "Received %S!" x)))
- (message "After!"))
-
-(cl-loop for process being the hash-values of erl--processes do
-         (erl-send process 1337))
-
-(defun erl-make-pid (conn id)
+(defun erl-self (conn)
+  "Return an Erlang PID object for this process on the node connection CONN."
   (let ((name (process-get conn 'name))
-        (creation (process-get conn 'creation))
-        (serial 0))
+        (id (erl-process-id erl--self))
+        (serial 0)
+        (creation (process-get conn 'creation)))
     `[,erl-tag pid ,name ,id ,serial ,creation]))
 
 (defun erl-rpc (conn module function &rest args)
@@ -404,26 +410,11 @@
       (erl--write-uint 4 (+ 1 (string-bytes control-msg) (string-bytes msg)))
       [112] ; Pass through
       control-msg
-      msg))))
+      msg)))
+  (erl-receive (`[rex ,x] x)))
 
-;; Try sending a msg
-(let* ((name-b (process-get erl-conn 'name-b))
-       (pid (erl-make-pid erl-conn 0))
-       (control-msg (erl-term-to-binary
-                     ;; `[23 ,(erl-self erl-conn) [rex ,name-b] #xbb])) ; SEND_SENDER_TT
-                     `[6 ,pid nil rex]
-                     ))
-       (msg (erl-term-to-binary
-             ;; {Who, {call, M, F, A, GroupLeader}}
-             `[,pid [call erlang node () ,pid]]
-             )))
-  (process-send-string
-   erl-conn
-   (concat
-    (erl--write-uint 4 (+ 1 (string-bytes control-msg) (string-bytes msg)))
-    [112] ; Pass through
-    control-msg
-    msg)))
+(erl-spawn
+ (message "Result of RPC: %S" (erl-rpc erl-conn 'erlang 'node)))
 
 (require 'ert)
 
