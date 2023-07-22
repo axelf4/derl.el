@@ -242,7 +242,7 @@
           (if cell (setcdr cell xs) (setq erl--mailbox xs))))
     and prev = cell with result while
     (let (continue)
-      (setq result (pcase (car cell) ,@arms (_ (setq continue t) nil)))
+      (setq result (pcase (car cell) ,@arms (pcase--dontcare (setq continue t) nil)))
       continue)
     finally (if prev (setcdr prev (cdr cell)) (pop erl--mailbox))
     finally return result))
