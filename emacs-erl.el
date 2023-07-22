@@ -203,7 +203,7 @@
 
 (cl-defstruct (erl-process (:type vector) (:constructor nil)
                            (:copier nil) (:predicate nil))
-  (id (:read-only t)) (cond-var (:read-only t)) mailbox)
+  (id (:read-only t)) (cond-var (:read-only t)) mailbox thread)
 
 (defvar erl--processes (make-hash-table :test 'eql)
   "Map of PID:s to processes.")
@@ -217,26 +217,35 @@
   `(let* ((id (cl-incf erl--next-pid))
           (mutex (make-mutex))
           (cond-var (make-condition-variable mutex))
-          (process (vector id cond-var ()))
+          (process (vector id cond-var () nil))
           (fun (lambda ()
                  (let ((erl--self process) erl--mailbox)
                    (unwind-protect (progn ,@body)
                      (remhash (erl-process-id erl--self) erl--processes)))))
           (thread (make-thread fun)))
-     (puthash id process erl--processes)))
+     (setf (erl-process-thread process) thread)
+     (puthash id process erl--processes)
+     id))
 
-;; TODO Selective receive
 (defmacro erl-receive (&rest arms)
-  `(pcase
-       (progn
-         (unless erl--mailbox
-           (with-mutex (condition-mutex (erl-process-cond-var erl--self))
-             (while (null (erl-process-mailbox erl--self))
-               (condition-wait (erl-process-cond-var erl--self)))
-             (setf erl--mailbox (nreverse (erl-process-mailbox erl--self))
-                   (erl-process-mailbox erl--self) ())))
-         (pop erl--mailbox))
-     ,@arms))
+  `(cl-loop
+    with fetch =
+    (lambda ()
+      (with-mutex (condition-mutex (erl-process-cond-var erl--self))
+        (while (null (erl-process-mailbox erl--self))
+          (condition-wait (erl-process-cond-var erl--self)))
+        (prog1 (nreverse (erl-process-mailbox erl--self))
+          (setf (erl-process-mailbox erl--self) ()))))
+    for cell = (or erl--mailbox (setq erl--mailbox (funcall fetch))) then
+    (or (cdr cell)
+        (let ((xs (funcall fetch)))
+          (if cell (setcdr cell xs) (setq erl--mailbox xs))))
+    and prev = cell with result while
+    (let (continue)
+      (setq result (pcase (car cell) ,@arms (_ (setq continue t) nil)))
+      continue)
+    finally (if prev (setcdr prev (cdr cell)) (pop erl--mailbox))
+    finally return result))
 
 (defun erl-send (pid expr)
   (when-let (process (gethash pid erl--processes))
@@ -444,3 +453,16 @@
 (ert-deftest erl-roundtrip-test ()
   (should (let ((x [rex "hej"]))
             (equal (erl-binary-to-term (erl-term-to-binary x)) x))))
+
+(ert-deftest erl-selective-receive-test ()
+  (should (equal
+           (let* (result
+                  (pid (erl-spawn
+                        (erl-receive (3 t))
+                        (setq result erl--mailbox))))
+             (erl-send pid 1)
+             (erl-send pid 2)
+             (erl-send pid 3)
+             (thread-join (erl-process-thread (gethash pid erl--processes)))
+             result)
+           '(1 2))))
