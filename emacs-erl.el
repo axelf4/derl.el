@@ -1,7 +1,5 @@
 ;;; emacs-erl.el --- Erlang toolkit  -*- lexical-binding: t -*-
 
-(require 'bindat)
-
 (defmacro erl--read-uint (n string offset)
   "Read N-byte network-endian unsigned integer from STRING at OFFSET."
   (macroexp-let2* symbolp ((s string) (j offset))
@@ -26,19 +24,6 @@
 (defun epmd-port-please (name cb)
   "Get the distribution port of the node NAME."
   (let* ((epmd-port 4369)
-         (port2-resp-bindat-spec
-          (bindat-type
-            (tag u8 :pack-val 119)
-            (result u8)
-            (data
-             . (if (/= result 0) (unit nil)
-                 (struct
-                  (portno uint 16)
-                  (node-type u8)
-                  (protocol u8)
-                  (highest-version uint 16) (lowest-version uint 16)
-                  (nlen uint 16) (node-name str nlen)
-                  (elen uint 16) (extra vec elen u8))))))
          (proc
           (make-network-process
            :name "epmd-port-req" :host 'local :service epmd-port
@@ -46,10 +31,11 @@
            (lambda (proc string)
              (set-process-sentinel proc nil)
              (delete-process proc)
-             (let* ((alist (bindat-unpack port2-resp-bindat-spec string))
-                    (result (cdr (assq 'result alist))))
-               (funcall cb (if (/= result 0) (cons 'error result)
-                             (bindat-get-field alist 'data 'portno)))))
+             (cl-assert (eq (aref string 0) 119)) ; PORT2_RESP
+             (let ((result (aref string 1)))
+               (funcall
+                cb (if (/= result 0) (cons 'error result)
+                     (erl--read-uint 2 string 2))))) ; portno
            :sentinel (lambda (proc event) (funcall cb (cons 'error event))))))
     (let ((s (concat (erl--write-uint 2 (1+ (string-bytes name)))
                      [122] ; PORT_PLEASE2_REQ
@@ -211,7 +197,7 @@
 
 ;; Process-local variables
 (defvar erl--self "The current process.")
-(defvar erl--mailbox "The private mailbox of the current process.")
+(defvar erl--mailbox "The local mailbox of the current process.")
 
 (defmacro erl-spawn (&rest body)
   `(let* ((id (cl-incf erl--next-pid))
@@ -263,16 +249,6 @@
 
 ;;; Erlang Distribution Protocol
 
-(defconst erl-recv-challenge-bindat-spec
-  (bindat-type
-    (length uint 16)
-    (tag u8 :pack-val ?N)
-    (flags uint 64)
-    (challenge uint 32)
-    (creation uint 32)
-    (nlen uint 16)
-    (name str nlen)))
-
 (defun erl--gen-digest (challenge cookie)
   "Generate a message digest (the \"gen_digest()\" function)."
   (secure-hash 'md5 (concat cookie (number-to-string challenge)) nil nil t))
@@ -304,24 +280,25 @@
                (set-process-filter proc #'recv-challenge)))
             ;; TODO alive and case 3B)
             (t (error "Unknown status: %S" s)))
-           ;; proc "")))
-           proc (prog1 (process-get proc 'buf) (process-put proc 'buf "")))))
+           proc "")))
        (recv-challenge
         (proc string)
-        (let* ((alist (bindat-unpack erl-recv-challenge-bindat-spec string))
-               (creation-b (cdr (assq 'creation alist)))
-               (name-b (cdr (assq 'name alist)))
-               (challenge-b (cdr (assq 'challenge alist)))
-               (challenge-a (random (ash 1 32))) ; #x100000000
-               (digest (erl--gen-digest challenge-b cookie)))
-          (process-put proc 'name-b (intern name-b))
-          (process-put proc 'creation-b creation-b)
-          (process-send-string
-           proc (concat [0 21 ; Length
-                           ?r] ; send_challenge_reply tag
-                        (erl--write-uint 4 challenge-a)
-                        digest))
-          (set-process-filter proc #'recv-challenge-ack)))
+        (when-let (s (get-msg proc string))
+          (cl-assert (eq (aref s 0) ?N)) ; recv_challenge_reply tag
+          (let* ((challenge-b (erl--read-uint 4 s 9))
+                 (creation-b (erl--read-uint 4 s 13))
+                 (nlen (erl--read-uint 2 s 17))
+                 (name-b (substring s 19 (+ 19 nlen)))
+                 (challenge-a (random (ash 1 32))) ; #x100000000
+                 (digest (erl--gen-digest challenge-b cookie)))
+            (process-put proc 'name-b (intern name-b))
+            (process-put proc 'creation-b creation-b)
+            (process-send-string
+             proc (concat [0 21 ; Length
+                             ?r] ; send_challenge_reply tag
+                          (erl--write-uint 4 challenge-a)
+                          digest))
+            (set-process-filter proc #'recv-challenge-ack))))
        (recv-challenge-ack
         (proc string)
         (unless (eq (aref string 2) ?a) (error "Bad tag"))
@@ -424,6 +401,9 @@
 
 (erl-spawn
  (message "Result of RPC: %S" (erl-rpc erl-conn 'erlang 'node)))
+
+(erl-spawn
+ (message "Result of RPC: %S" (erl-rpc erl-conn 'c 'lm)))
 
 (require 'ert)
 
