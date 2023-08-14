@@ -6,7 +6,7 @@
 
 (defmacro derl--read-uint (n string offset)
   "Read N-byte network-endian unsigned integer from STRING at OFFSET."
-  (macroexp-let2* symbolp ((s string) (j offset))
+  (macroexp-let2* nil ((s string) (j offset))
     (cl-loop
      for i below n collect
      (let ((x `(aref ,string ,(cl-case i
@@ -16,8 +16,21 @@
        (if (< i (1- n)) `(ash ,x ,(* 8 (- n i 1))) x))
      into xs finally return `(logior ,@xs))))
 
+(defmacro derl--read-uint* (n &optional position)
+  "Read N-byte network-endian unsigned integer."
+  (cl-loop
+   for i below n collect
+   (let ((x `(get-byte ,(cl-case i
+                          (0 'p)
+                          (1 `(1+ p))
+                          (t `(+ p ,i))))))
+     (if (< i (1- n)) `(ash ,x ,(* 8 (- n i 1))) x))
+   into xs finally return `(let ((p ,(or position '(point))))
+                             ,@(unless position `((forward-char ,n)))
+                             (logior ,@xs))))
+
 (defmacro derl--write-uint (n integer)
-  (macroexp-let2 symbolp x integer
+  (macroexp-let2 nil x integer
     (cl-loop
      for i below n with xs do
      (push `(logand ,(if (= i 0) x `(ash ,x ,(* -8 i))) #xff) xs)
@@ -76,10 +89,10 @@
          (forward-char 2)
          (logior (ash (char-before (1- (point))) 8) (char-before)))
        (read4 ()
-         (forward-char 4)
-         (let ((pos (point)))
-           (logior (ash (char-before (- pos 3)) 24) (ash (char-before (- pos 2)) 16)
-                   (ash (char-before (1- pos)) 8) (char-before)))))
+         (let ((p (point)))
+           (forward-char 4)
+           (logior (ash (get-byte p) 24) (ash (get-byte (1+ p)) 16)
+                   (ash (get-byte (+ p 2)) 8) (get-byte (+ p 3))))))
     (forward-char)
     (pcase (char-before)
       (97 ; SMALL_INTEGER_EXT
@@ -257,18 +270,17 @@
 (cl-defun derl-connect (host port cookie)
   (cl-labels
       ((get-msg (proc string lenlen)
-         (let* ((saved-s (process-get proc 'buf))
-                (s (cond ((string= saved-s "") string)
-                         ((string= string "") saved-s)
-                         (t (concat saved-s string))))
-                (s-len (string-bytes s)) length)
-           (if (or (< s-len lenlen)
-                   (> (setq len (+ lenlen (if (= lenlen 4) (derl--read-uint 4 s 0)
-                                            (derl--read-uint 2 s 0))))
-                      s-len))
-               (progn (process-put proc 'buf s) nil)
-             (process-put proc 'buf (substring s len))
-             (substring s lenlen len))))
+         (with-current-buffer (process-buffer proc)
+           (insert string)
+           (let (len)
+             (when (and (<= lenlen (buffer-size))
+                        (<= (setq len (+ lenlen (if (= lenlen 4)
+                                                    (derl--read-uint* 4 (point-min))
+                                                  (derl--read-uint* 2 (point-min)))))
+                            (buffer-size)))
+               (prog1 (buffer-substring-no-properties
+                       (+ (point-min) lenlen) (+ (point-min) len))
+                 (delete-region (point-min) (+ (point-min) len)))))))
        (recv-status (proc string)
          (when-let (s (get-msg proc string 2))
            (unless (eq (aref s 0) ?s) (error "Bad status"))
@@ -329,30 +341,34 @@
                    (`[22 ,_from-pid [,_ pid ,_name ,to-pid ,_serial ,_creation]]
                     (derl-send to-pid msg))))))
            (connected-filter proc ""))))
-    (let ((proc (make-network-process
-                 :name "erl-emacs" :host host :service port
-                 :coding 'raw-text :filter-multibyte nil :filter #'recv-status
-                 :plist (list 'buf "")))
-          (flags
-           (eval-when-compile
-             (derl--write-uint
-              8 (logior
-                 #x4 ; DFLAG_EXTENDED_REFERENCES
-                 #x10 ; DFLAG_FUN_TAGS
-                 #x80 ; DFLAG_NEW_FUN_TAGS
-                 #x100 ; DFLAG_EXTENDED_PID_PORTS
-                 #x200 ; DFLAG_EXPORT_PTR_TAG
-                 #x400 ; DFLAG_BIT_BINARIES
-                 #x800 ; DFLAG_NEW_FLOATS
-                 #x10000 ; DFLAG_UTF8_ATOMS
-                 #x20000 ; DFLAG_MAP_TAG
-                 #x40000 ; DFLAG_BIG_CREATION
-                 #x80000 ; DFLAG_SEND_SENDER
-                 #x1000000 ; DFLAG_HANDSHAKE_23
-                 #x2000000 ; DFLAG_UNLINK_ID
-                 (ash 1 33) ; DFLAG_NAME_ME
-                 (ash 1 34))))) ; DFLAG_V4_NC
-          (name (system-name)))
+    (let* ((buf (generate-new-buffer " *erl recv*" t))
+           (proc (make-network-process
+                  :name "erl-emacs" :buffer buf :host host :service port
+                  :coding 'raw-text :filter-multibyte nil :filter #'recv-status
+                  :plist ()))
+           (flags
+            (eval-when-compile
+              (derl--write-uint
+               8 (logior
+                  #x4 ; DFLAG_EXTENDED_REFERENCES
+                  #x10 ; DFLAG_FUN_TAGS
+                  #x80 ; DFLAG_NEW_FUN_TAGS
+                  #x100 ; DFLAG_EXTENDED_PID_PORTS
+                  #x200 ; DFLAG_EXPORT_PTR_TAG
+                  #x400 ; DFLAG_BIT_BINARIES
+                  #x800 ; DFLAG_NEW_FLOATS
+                  #x10000 ; DFLAG_UTF8_ATOMS
+                  #x20000 ; DFLAG_MAP_TAG
+                  #x40000 ; DFLAG_BIG_CREATION
+                  #x80000 ; DFLAG_SEND_SENDER
+                  #x1000000 ; DFLAG_HANDSHAKE_23
+                  #x2000000 ; DFLAG_UNLINK_ID
+                  (ash 1 33) ; DFLAG_NAME_ME
+                  (ash 1 34))))) ; DFLAG_V4_NC
+           (name (system-name)))
+      (with-current-buffer buf
+        (set-buffer-multibyte nil)
+        (buffer-disable-undo))
       ;; Send send_name message
       (process-send-string
        proc (concat (derl--write-uint 2 (+ 15 (string-bytes name))) ; Length
