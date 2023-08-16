@@ -1,29 +1,30 @@
 ;;; derl.el --- Erlang distribution protocol implementation  -*- lexical-binding: t -*-
 
+;;; Commentary:
+
 ;; Start with "erl -sname arnie" and get cookie
 
 (eval-when-compile (require 'cl-lib))
 (require 'generator)
 
-(defmacro derl--read-uint (n &optional position)
-  "Read N-byte network-endian unsigned integer."
-  (cl-loop
-   for i below n collect
-   (let ((x `(get-byte ,(cl-case i
-                          (0 'p)
-                          (1 `(1+ p))
-                          (t `(+ p ,i))))))
-     (if (< i (1- n)) `(ash ,x ,(* 8 (- n i 1))) x))
-   into xs finally return `(let ((p ,(or position '(point))))
-                             ,@(unless position `((forward-char ,n)))
-                             (logior ,@xs))))
-
-(defmacro derl--write-uint (n integer)
-  (macroexp-let2 nil x integer
+(eval-when-compile
+  (defmacro derl--read-uint (n)
+    "Read N-byte network-endian unsigned integer."
     (cl-loop
-     for i below n with xs do
-     (push `(logand ,(if (= i 0) x `(ash ,x ,(* -8 i))) #xff) xs)
-     finally return `(unibyte-string ,@xs))))
+     for i below n collect
+     (let ((x `(get-byte ,(cl-case i
+                            (0 'p)
+                            (1 `(1+ p))
+                            (t `(+ p ,i))))))
+       (if (< i (1- n)) `(ash ,x ,(* 8 (- n i 1))) x))
+     into xs finally return `(let ((p (point))) (forward-char ,n) (logior ,@xs))))
+
+  (defmacro derl--uint-string (n integer)
+    (macroexp-let2 nil x integer
+      (cl-loop
+       for i below n with xs do
+       (push `(logand ,(if (= i 0) x `(ash ,x ,(* -8 i))) #xff) xs)
+       finally return `(unibyte-string ,@xs)))))
 
 ;;; Erlang Port Mapper Daemon (EPMD) interaction
 
@@ -36,12 +37,12 @@
         result)
     (let ((proc
            (make-network-process
-            :name "epmd-port-req" :host 'local :service 4369
+            :name "epmd-port-req" :host 'local :service 4369 :plist (list 'buffer "")
             :coding 'raw-text :filter-multibyte nil :filter
             (lambda (proc string)
-              (setq string (concat (process-get proc 'buf) string))
+              (setq string (concat (process-get proc 'buffer) string))
               (if (length< string 4)
-                  (process-put proc 'buf string)
+                  (process-put proc 'buffer string)
                 (set-process-sentinel proc nil)
                 (delete-process proc)
                 (cl-assert (eq (aref string 0) 119)) ; PORT2_RESP
@@ -49,10 +50,9 @@
                   (funcall
                    cb (if (/= result 0) (cons 'error result)
                         (logior (ash (aref string 2) 8) (aref string 3))))))) ; portno
-            :sentinel (lambda (proc event) (funcall cb (cons 'error event)))
-            :plist (list 'buf ""))))
+            :sentinel (lambda (proc event) (funcall cb (cons 'error event))))))
       (process-send-string
-       proc (concat (derl--write-uint 2 (1+ (string-bytes name)))
+       proc (concat (derl--uint-string 2 (1+ (string-bytes name)))
                     [122] ; PORT_PLEASE2_REQ
                     name))
       proc)))
@@ -65,10 +65,10 @@
 (defconst derl-ext-version 131)
 
 (defconst derl-tag (make-symbol "ext-tag")
-  "Marks the encompassing vector as a special Erlang object (i.e. not a tuple).")
+  "Marks the encompassing vector as a special Erlang term (i.e. not a tuple).")
 
 (defun derl-read ()
-  "Read the Erlang external term following point."
+  "Read term encoded according to the Erlang external term format following point."
   (when (eq (char-after) 80) ; Compressed term
     (delete-char 5) ; Skip tag and uncompressed size
     (unless (zlib-decompress-region (point) (point-max))
@@ -97,42 +97,57 @@
               (serial (read4))
               (creation (read4)))
          (vector derl-tag 'pid node id serial creation)))
-
       ((or (and 104 (let n (progn (forward-char) (char-before)))) ; SMALL_TUPLE_EXT
            (and 105 (let n (read4)))) ; LARGE_TUPLE_EXT
        (cl-loop repeat n collect (derl-read) into xs
                 finally return (apply #'vector xs)))
 
+      (116 ; MAP_EXT
+       (cl-loop with n = (read4) with x = (make-hash-table :test 'equal :size n)
+                repeat n do (puthash (derl-read) (derl-read) x) finally return x))
       (106) ; NIL_EXT
       (107 ; STRING_EXT
        (cl-loop repeat (read2) collect (progn (forward-char) (char-before))))
       (108 ; LIST_EXT
-       (cl-loop repeat (read4) collect (derl-read) into xs
-                finally (setcdr (last xs) (derl-read))))
+       (let ((xs (cl-loop repeat (read4) collect (derl-read))))
+         (setcdr (last xs) (derl-read))
+         xs))
       (109 ; BINARY_EXT
        (let ((n (read4)))
          (forward-char n)
          (buffer-substring-no-properties (- (point) n) (point))))
       ((or (and 110 (let n (progn (forward-char) (char-before)))) ; SMALL_BIG_EXT
            (and 111 (let n (read4)))) ; LARGE_BIG_EXT
-       (cl-loop with sign = (progn (forward-char) (char-before))
-                with x = 0 for i below n do
-                (setq x (logior x (ash (char-after) (ash i 1))))
+       (cl-loop with sign = (progn (forward-char) (char-before)) and x = 0
+                for i below n do
+                (setq x (logior x (ash (get-byte) (ash i 1))))
                 (forward-char)
                 finally return (if (= sign 0) x (- x))))
+      (90 ; NEWER_REFERENCE_EXT
+       (let* ((len (read2))
+              (node (derl-read))
+              (creation (read4))
+              (id (cl-loop repeat len collect (read4))))
+         (vector derl-tag 'reference node id creation)))
 
-      ((or (and 118 (let n (read2)) (let enc 'utf-8)) ; ATOM_UTF8_EXT
-           (and 119 (let n (progn (forward-char) (char-before)))
-                (let enc 'utf-8)) ; SMALL_ATOM_UTF8_EXT
-           (and 100 (let n (read2)) (let enc 'latin-1)) ; ATOM_EXT
-           (and 115 (let n (progn (forward-char) (char-before)))
-                (let enc 'latin-1))) ; SMALL_ATOM_EXT
+      (70 ; NEW_FLOAT_EXT
+       (let* ((x (read4))
+              (e (logand (ash x -20) #x7ff))
+              (f (ldexp (logior (ash (logand x #xfffff) 32) (read4)) -52))
+              (bias 1023))
+         (* (if (= (logand x (ash 1 31)) 0) 1 -1)
+            (cl-case e
+              (#x7ff (if (= f 0) 1e+INF 0e+NaN))
+              (0 (ldexp f (1- bias)))
+              (t (ldexp (1+ f) (- e bias)))))))
+      ((or (and 118 (let n (read2))) ; ATOM_UTF8_EXT
+           (and 119 (let n (progn (forward-char) (char-before))))) ; SMALL_ATOM_UTF8_EXT
        (forward-char n)
-       (intern (decode-coding-region (- (point) n) (point) enc t)))
+       (intern (decode-coding-region (- (point) n) (point) 'utf-8 t)))
       (tag (error "Unknown tag `%s'" tag)))))
 
 (defun derl-write (term)
-  "Print the Erlang external representation of TERM at point."
+  "Print TERM at point according to the Erlang external term format."
   (cl-labels
       ((write4 (i)
          (insert (logand (ash i -24) #xff) (logand (ash i -16) #xff)
@@ -144,7 +159,14 @@
         ((<= (- #x80000000) i #x7fffffff)
          (insert 98) ; INTEGER_EXT
          (write4 i))
-        (t (error "TODO Write bignum"))))
+        (t (cl-loop
+            with p = (point) and n = 0 initially (insert (if (>= i 0) 0 (setq i (- i)) 1))
+            while (> i 0) do (insert (logand i #xff)) (setq i (ash i -8) n (1+ n))
+            finally (save-excursion
+                      (goto-char p)
+                      (if (<= n #xff) (insert 110 n) ; SMALL_BIG_EXT
+                        (insert 111) ; LARGE_BIG_EXT
+                        (write4 n)))))))
       (`[,(pred (eq derl-tag)) pid ,node ,id ,serial ,creation]
        (insert 88) ; NEW_PID_EXT
        (derl-write node)
@@ -156,18 +178,40 @@
          (insert 105) ; LARGE_TUPLE_EXT
          (write4 (length term)))
        (cl-loop for x across term do (derl-write x)))
+      ((pred hash-table-p)
+       (insert 116) ; MAP_EXT
+       (write4 (hash-table-count term))
+       (maphash (lambda (k v) (derl-write k) (derl-write v)) term))
       ('nil (insert 106)) ; NIL_EXT
-      ((pred consp)
+      ((pred consp) ; TODO Use STRING_EXT if possible
        (insert 108) ; LIST_EXT
-       (let ((sp (point)) n)
-         (while (progn (derl-write (pop term))
-                       (setq n (1+ n))
-                       (consp term)))
+       (let ((sp (point)) (n 1))
+         (while (progn (derl-write (pop term)) (consp term)) (setq n (1+ n)))
          (derl-write term)
          (save-excursion (goto-char sp) (write4 n))))
+      ((pred stringp)
+       (insert 109) ; BINARY_EXT
+       (let ((n (encode-coding-string term 'utf-8 nil (current-buffer))))
+         (write4 n)
+         (forward-char n)))
+      ((pred floatp)
+       (let* ((exp (frexp term)) (sgnfcand (pop exp))
+              (sign (if (>= sgnfcand 0) 0 (setq sgnfcand (- sgnfcand)) (ash 1 31)))
+              (bias 1023) e f)
+       (insert 70) ; NEW_FLOAT_EXT
+       (cond
+        ((isnan term) (setq e #x7ff f 1))
+        ((eq sgnfcand 1e+INF) (setq e #x7ff f 0))
+        ((<= exp (- 1 bias)) ; Subnormals
+         (setq e 0 f (floor (ldexp sgnfcand (+ 52 exp (1- bias))))))
+        ;; Ensure significand >= 1 by decrementing exponent
+        (t (setq e (+ bias exp -1)
+                 f (floor (ldexp (1- (* 2 sgnfcand)) 52)))))
+       (write4 (logior sign (ash e 20) (logand (ash f -32) #xfffff)))
+       (write4 (logand f #xffffffff))))
       ((pred symbolp)
        (let ((n (encode-coding-string
-                 (symbol-name term) 'utf-8 t (current-buffer))))
+                 (symbol-name term) 'utf-8 nil (current-buffer))))
          (if (<= n #xff) (insert 119 n) ; SMALL_ATOM_UTF8_EXT
            (insert 118) ; ATOM_UTF8_EXT
            (write4 n))
@@ -217,40 +261,47 @@
 
 (defun derl--scheduler-run ()
   (unless (= (derl-process-id derl--self) 0) (error "Scheduling from inferior process"))
-  (message "Running scheduler")
   (setq derl--scheduler-timer nil)
   (while (let* ((schedulable (cl-loop for p being the hash-values of derl--processes
                                       unless (derl-process-blocked p) collect p))
-                (derl--self (nth (random (length schedulable)) schedulable)))
+                (proc (nth (random (length schedulable)) schedulable)))
            (cond
             ;; Main process is blocked on externalities
-            ((null derl--self) (accept-process-output))
+            ((null schedulable) (accept-process-output))
             ;; Pass control back to main process
-            ((= (derl-process-id derl--self) 0)
+            ((= (derl-process-id proc) 0)
              (when (cdr schedulable) (derl--schedule-scheduler))
              nil)
             (t (ignore-error iter-end-of-sequence
-                 (iter-next (derl-process-function derl--self)))
+                 (iter-next (derl-process-function proc)))
                t)))))
+
+(cl-defmacro derl-yield (&environment env)
+  (if (assq 'iter-yield env) '(iter-yield nil) '(derl--scheduler-run)))
 
 (defun derl-spawn (fun)
   (let* ((id (cl-incf derl--next-pid))
-         (fun* (iter-make (unwind-protect (iter-yield-from fun)
-                            (remhash id derl--processes))))
-         (process (vector id fun* () nil)))
+         (process (vector id nil () nil)))
+    (aset process 1
+          (iter-make
+           (let ((derl--self process) (derl--mailbox ()))
+             (condition-case err (iter-yield-from fun)
+               (normal)
+               (t (message "Process %d exited with error `%S'."
+                           (derl-process-id process) (error-message-string err))))
+             (remhash id derl--processes))))
     (puthash id process derl--processes)
     (derl--schedule-scheduler)
     id))
 
 (cl-defmacro derl-receive
-    (&body arms &aux (catchallp (cl-loop for (x) in arms thereis (symbolp x)))
-           &environment env)
+    (&rest arms &aux (catchallp (cl-loop for (x) in arms thereis (symbolp x))))
+  (declare (debug (&rest (pcase-PAT body))))
   `(cl-loop
     for cell =
     (or (if cell (cdr cell) derl--mailbox)
         (cl-letf (((derl-process-blocked derl--self) t))
-          (while (null (derl-process-mailbox derl--self))
-            ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--scheduler-run)))
+          (while (null (derl-process-mailbox derl--self)) (derl-yield))
           (let ((xs (nreverse (derl-process-mailbox derl--self))))
             (setf (derl-process-mailbox derl--self) ())
             (if cell (setcdr cell xs) (setq derl--mailbox xs)))))
@@ -261,13 +312,28 @@
     finally (if prev (setcdr prev (cdr cell)) (pop derl--mailbox))
     finally return result))
 
-(defun derl-send (pid expr)
-  (when-let (process (gethash pid derl--processes))
-    (push expr (derl-process-mailbox process))
-    (derl--schedule-scheduler)
-    (setf (derl-process-blocked process) nil)))
-
-(derl-send (derl-spawn (iter-make (message "ran: %S" (derl-receive (x x))))) 545)
+(defun derl-send (pid expr &optional conn)
+  "Send the message EXPR to PID, optionally over CONN."
+  (if (null conn)
+      (when-let (process (gethash pid derl--processes))
+        (push expr (derl-process-mailbox process))
+        (derl--schedule-scheduler)
+        (setf (derl-process-blocked process) nil))
+    (let* ((from (derl-self conn))
+           (control-msg
+            (derl-term-to-binary
+             (if (symbolp pid) `[6 ,from nil ,pid] ; REG_SEND
+               (let* ((name (process-get conn 'name-b))
+                      (creation (process-get conn 'creation-b))
+                      (to `[,derl-tag pid ,name ,pid 0 ,creation]))
+                 `[22 ,from ,to])))) ; SEND_SENDER
+           (msg (derl-term-to-binary expr)))
+      (process-send-string
+       conn
+       (concat
+        (derl--uint-string 4 (+ 1 (string-bytes control-msg) (string-bytes msg)))
+        [112] ; Pass through
+        control-msg msg)))))
 
 ;;; Erlang Distribution Protocol
 
@@ -275,7 +341,7 @@
   "Generate a message digest (the \"gen_digest()\" function)."
   (secure-hash 'md5 (concat cookie (number-to-string challenge)) nil nil t))
 
-(cl-defun derl-connect (host port cookie)
+(defun derl-connect (host port cookie)
   (cl-labels
       ((recv-status (proc)
          (unless (eq (get-byte) ?s) (error "Bad status"))
@@ -308,7 +374,7 @@
            (process-send-string
             proc (concat [0 21 ; Length
                             ?r] ; send_challenge_reply tag
-                         (derl--write-uint 4 challenge-a)
+                         (derl--uint-string 4 challenge-a)
                          digest))
            (process-put proc 'filter #'recv-challenge-ack)))
        (recv-challenge-ack (proc)
@@ -318,7 +384,7 @@
            (message "Got challenge ACK: digest %S!" digest)
            (process-put proc 'filter #'connected)))
        (connected (proc)
-         (if (= (- (point-max) (point-min)) 0)
+         (if (= (point-min) (point-max))
              (process-send-string proc "\0\0\0\0") ; Zero-length heartbeat
            (cl-assert (eq (get-byte) 112)) ; Check that type is pass through
            (forward-char)
@@ -333,7 +399,7 @@
              (pcase control-msg
                ;; SEND_SENDER
                (`[22 ,_from-pid [,_ pid ,_name ,to-pid ,_serial ,_creation]]
-                (derl-send to-pid msg))))))
+                (! to-pid msg))))))
        (filter (proc string)
          (with-current-buffer (process-buffer proc)
            (insert string)
@@ -348,7 +414,7 @@
                  (save-restriction
                    (narrow-to-region (point) (+ (point-min) len))
                    (funcall f proc)
-                   (unless (= (point) (point-max)) (error "Bad length")))
+                   (when (< (point) (point-max)) (error "Bad length")))
                  (delete-region (point-min) (+ (point-min) len)))))
            (goto-char (point-max)))))
     (let* ((buf (generate-new-buffer " *erl recv*" t))
@@ -358,7 +424,7 @@
                   :plist (list 'filter #'recv-status)))
            (flags
             (eval-when-compile
-              (derl--write-uint
+              (derl--uint-string
                8 (logior
                   #x4 ; DFLAG_EXTENDED_REFERENCES
                   #x10 ; DFLAG_FUN_TAGS
@@ -381,29 +447,13 @@
         (buffer-disable-undo))
       ;; Send send_name message
       (process-send-string
-       proc (concat (derl--write-uint 2 (+ 15 (string-bytes name))) ; Length
+       proc (concat (derl--uint-string 2 (+ 15 (string-bytes name))) ; Length
                     [?N] ; send_name tag
                     flags
                     [0 0 0 0] ; Creation
-                    (derl--write-uint 2 (string-bytes name)) ; Nlen
+                    (derl--uint-string 2 (string-bytes name)) ; Nlen
                     name))
       proc)))
-
-(defun derl--offload-process (proc)
-  (make-thread
-   (lambda ()
-     (set-process-thread proc (current-thread))
-     (while (eq (process-status proc) 'open)
-       (accept-process-output proc)))))
-
-;; (cl-loop for process being the hash-values of derl--processes do
-;;          (derl-send (derl-process-id process) 1337))
-
-;; (setq derl-conn (derl-connect 'local (derl-epmd-port-please "arnie") "IYQBVJUETYMWBBGPADPN"))
-;; (delete-process derl-conn)
-;; (derl--offload-process derl-conn)
-
-;; (message "Result of RPC: %S" (derl-rpc derl-conn 'erlang 'node))
 
 (defun derl-self (conn)
   "Return an Erlang PID object for this process on the node connection CONN."
@@ -415,54 +465,15 @@
 
 (defun derl-rpc (conn module function &rest args)
   "Apply FUNCTION in MODULE to ARGS on the remote node over CONN."
-  (let* ((name-b (process-get conn 'name-b))
-         (pid (derl-self conn))
-         (control-msg (derl-term-to-binary `[6 ,pid nil rex])) ; REG_SEND
-         (msg (derl-term-to-binary
-               ;; {Who, {call, M, F, A, GroupLeader}}
-               `[,pid [call ,module ,function ,args ,pid]])))
-    (process-send-string
-     conn
-     (concat
-      (derl--write-uint 4 (+ 1 (string-bytes control-msg) (string-bytes msg)))
-      [112] ; Pass through
-      control-msg msg)))
+  (let ((pid (derl-self conn)))
+    ;; {Who, {call, M, F, A, GroupLeader}}
+    (! 'rex `[,pid [call ,module ,function ,args ,pid]] conn))
   (derl-receive (`[rex ,x] x)))
 
-(require 'ert)
+(provide 'derl)
 
-(ert-deftest derl-gen-digest-test ()
-  (should (equal (derl--gen-digest #xb0babeef "kaka")
-                 "\327k1\f\326ck'\344\263m\C-F\305P\C-KP")))
+;; Local Variables:
+;; read-symbol-shorthands: (("!" . "derl-send"))
+;; End:
 
-(ert-deftest derl-read-test ()
-  (should (eq (derl-binary-to-term 131 97 #xff) 255))
-  (should (eq (derl-binary-to-term 131 98 #xff #xff #xfc #x18) -1000))
-  (should (equal (derl-binary-to-term 131 104 3 97 1 97 2 97 3) [1 2 3]))
-  (should (eq (derl-binary-to-term 131 106) ()))
-  (should (eq (derl-binary-to-term 131 98 255 255 255 255) -1)))
-
-(ert-deftest derl-write-test ()
-  (should (equal (derl-term-to-binary -1) "\203b\377\377\377\377"))
-  (should (equal (derl-term-to-binary (- #x80000000)) "\203b\200\0\0\0"))
-
-  (should
-   (equal 
-    (derl-term-to-binary [rex "hej"])
-    "\203h\C-bd\0\C-crexk\0\C-chej"
-    ;; (unibyte-string 131 104 2 100 0 3 114 101 120 107 0 3 104 101 106)
-    )))
-
-(ert-deftest derl-ext-roundtrip-test ()
-  (should (let ((x [rex "node"]))
-            (equal (derl-binary-to-term (derl-term-to-binary x)) x))))
-
-(ert-deftest derl-selective-receive-test ()
-  (let* (result
-         (pid (derl-spawn
-               (lambda () (derl-receive (3 t)) (setq result derl--mailbox)))))
-    (derl-send pid 1)
-    (derl-send pid 2)
-    (derl-send pid 3)
-    (thread-join (derl-process-thread (gethash pid derl--processes)))
-    (should (equal result '(1 2)))))
+;;; derl.el ends here
