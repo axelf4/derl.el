@@ -244,7 +244,7 @@
 (defvar derl--self [0 nil () nil ()]
   "The current `derl-process'.")
 (defvar derl--mailbox ()
-  "The local mailbox of the current process.")
+  "The local chronological order mailbox of the current process.")
 
 (defvar derl--processes
   (let ((table (make-hash-table :test 'eql)))
@@ -286,11 +286,11 @@
                t)))))
 
 (defun derl-spawn (fun)
-  (let* ((id (cl-incf derl--next-pid))
-         (process
-          (vector id (iter-make (let ((derl--mailbox ())) (iter-yield-from fun)))
-                  () nil ())))
-    (puthash id process derl--processes)
+  (let* ((id (cl-incf derl--next-pid)) m
+         (f (lambda (op value)
+              (let ((derl--mailbox m))
+                (unwind-protect (funcall fun op value) (setq m derl--mailbox))))))
+    (puthash id (vector id f () nil ()) derl--processes)
     (derl--scheduler-schedule)
     id))
 
