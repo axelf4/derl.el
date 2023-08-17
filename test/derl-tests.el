@@ -20,8 +20,7 @@
   (should (equal (derl-term-to-binary '(nil)) "\203l\0\0\0\1jj"))
   (should (equal (derl-term-to-binary [rex "ok"]) "\203h\2w\3rexm\0\0\0\2ok"))
 
-  (should (equal (derl-term-to-binary 1.1337) "\203F?\362#\242\234w\232k"))
-  )
+  (should (equal (derl-term-to-binary 1.1337) "\203F?\362#\242\234w\232k")))
 
 (ert-deftest derl-ext-roundtrip-test ()
   (should (let ((x [rex node]))
@@ -30,7 +29,16 @@
 (ert-deftest derl-selective-receive-test ()
   (let* (result
          (pid (derl-spawn
-               (iter-make () (derl-receive (2)) (setq result derl--mailbox)))))
-    (dotimes (i 3) (derl-send pid i))
+               (iter-make (derl-receive (2)) (setq result derl--mailbox)))))
+    (dotimes (i 3) (! pid i))
     (while (null result) (derl--scheduler-run))
     (should (equal result '(0 1)))))
+
+(ert-deftest derl-exit-normal-test ()
+  (let ((pid (derl-spawn (iter-make (derl-receive (x x))))))
+    (derl-exit pid 'normal)
+    (while (gethash pid derl--processes) (derl--scheduler-run))))
+
+;; Local Variables:
+;; read-symbol-shorthands: (("!" . "derl-send"))
+;; End:

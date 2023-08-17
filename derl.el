@@ -238,10 +238,10 @@
 
 (cl-defstruct (derl-process (:type vector) (:constructor nil)
                             (:copier nil) (:predicate nil))
-  (id (:read-only t)) function mailbox blocked)
+  (id (:read-only t)) function mailbox blocked exits)
 
 ;; Process-local variables
-(defvar derl--self [0 nil () nil]
+(defvar derl--self [0 nil () nil ()]
   "The current `derl-process'.")
 (defvar derl--mailbox ()
   "The local mailbox of the current process.")
@@ -252,47 +252,56 @@
     table)
   "Map of PID:s to processes.")
 (defvar derl--next-pid 0)
+(defvar derl--next-ref 0)
+
+(define-error 'normal "Normal exit" 'normal)
+
+(defun derl-make-ref ()
+  (prog1 derl--next-ref (setq derl--next-ref (1+ derl--next-ref))))
 
 (defvar derl--scheduler-timer nil)
 
-(defun derl--schedule-scheduler ()
+(defun derl--scheduler-schedule ()
   (unless derl--scheduler-timer
     (setq derl--scheduler-timer (run-with-timer 0 nil #'derl--scheduler-run))))
 
 (defun derl--scheduler-run ()
   (unless (= (derl-process-id derl--self) 0) (error "Scheduling from inferior process"))
   (setq derl--scheduler-timer nil)
-  (while (let* ((schedulable (cl-loop for p being the hash-values of derl--processes
-                                      unless (derl-process-blocked p) collect p))
-                (proc (nth (random (length schedulable)) schedulable)))
+  (while (let* ((schedulable
+                 (cl-loop for p being the hash-values of derl--processes
+                          unless (derl-process-blocked p) collect p))
+                (proc (and schedulable (nth (random (length schedulable)) schedulable))))
            (cond
             ;; Main process is blocked on externalities
-            ((null schedulable) (accept-process-output))
+            ((null schedulable) (accept-process-output nil 1))
             ;; Pass control back to main process
             ((= (derl-process-id proc) 0)
-             (when (cdr schedulable) (derl--schedule-scheduler))
+             (when (cdr schedulable) (derl--scheduler-schedule))
              nil)
-            (t (ignore-error iter-end-of-sequence
-                 (iter-next (derl-process-function proc)))
+            (t (let ((id (derl-process-id proc)) (derl--self proc))
+                 (condition-case err (iter-next (derl-process-function proc))
+                   ((iter-end-of-sequence normal) (remhash id derl--processes))
+                   (t (remhash id derl--processes)
+                      (message "Process %d exited with error: %S" id err))))
                t)))))
-
-(cl-defmacro derl-yield (&environment env)
-  (if (assq 'iter-yield env) '(iter-yield nil) '(derl--scheduler-run)))
 
 (defun derl-spawn (fun)
   (let* ((id (cl-incf derl--next-pid))
-         (process (vector id nil () nil)))
-    (aset process 1
-          (iter-make
-           (let ((derl--self process) (derl--mailbox ()))
-             (condition-case err (iter-yield-from fun)
-               (normal)
-               (t (message "Process %d exited with error `%S'."
-                           (derl-process-id process) (error-message-string err))))
-             (remhash id derl--processes))))
+         (process (vector id nil () nil ())))
+    (setf (derl-process-function process)
+          (iter-make (let ((derl--mailbox ())) (iter-yield-from fun))))
     (puthash id process derl--processes)
-    (derl--schedule-scheduler)
+    (derl--scheduler-schedule)
     id))
+
+(cl-defmacro derl-yield (&environment env)
+  `(progn
+     (unless (derl-process-exits derl--self)
+       ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--scheduler-run)))
+     (dolist (x (prog1 (derl-process-exits derl--self)
+                  (setf (derl-process-exits derl--self) ())))
+       (apply (car x) (cdr x)))))
 
 (cl-defmacro derl-receive
     (&rest arms &aux (catchallp (cl-loop for (x) in arms thereis (symbolp x))))
@@ -314,10 +323,11 @@
 
 (defun derl-send (pid expr &optional conn)
   "Send the message EXPR to PID, optionally over CONN."
+  (message "Sending %S to %S" expr pid)
   (if (null conn)
       (when-let (process (gethash pid derl--processes))
         (push expr (derl-process-mailbox process))
-        (derl--schedule-scheduler)
+        (derl--scheduler-schedule)
         (setf (derl-process-blocked process) nil))
     (let* ((from (derl-self conn))
            (control-msg
@@ -334,6 +344,13 @@
         (derl--uint-string 4 (+ 1 (string-bytes control-msg) (string-bytes msg)))
         [112] ; Pass through
         control-msg msg)))))
+
+(defun derl-exit (pid &rest args)
+  "Signal the exit REASON to PID."
+  (message "Got thing for %S , %S" pid args)
+  (when-let (process (gethash pid derl--processes))
+    (push args (derl-process-exits process))
+    (derl--scheduler-schedule)))
 
 ;;; Erlang Distribution Protocol
 
@@ -469,6 +486,15 @@
     ;; {Who, {call, M, F, A, GroupLeader}}
     (! 'rex `[,pid [call ,module ,function ,args ,pid]] conn))
   (derl-receive (`[rex ,x] x)))
+
+;; For simplicity this function may only be called from the main process
+(defun derl--call (fun)
+  "Delegate to generator FUN ensuring that spam is blocked."
+  (let* ((self (derl-process-id derl--self))
+         (ref (derl-make-ref))
+         (pid (derl-spawn (iter-make (! self (cons ref (iter-yield-from fun)))))))
+    (with-timeout (1 (derl-exit pid #'signal 'normal nil) 'timeout)
+      (derl-receive (`(,(pred (equal ref)) . ,x) x)))))
 
 (provide 'derl)
 
