@@ -238,7 +238,7 @@
 
 (cl-defstruct (derl-process (:type vector) (:constructor nil)
                             (:copier nil) (:predicate nil))
-  (id (:read-only t)) function mailbox blocked exits)
+  (id (:read-only t)) (function (:read-only t)) mailbox blocked exits)
 
 ;; Process-local variables
 (defvar derl--self [0 nil () nil ()]
@@ -287,9 +287,9 @@
 
 (defun derl-spawn (fun)
   (let* ((id (cl-incf derl--next-pid))
-         (process (vector id nil () nil ())))
-    (setf (derl-process-function process)
-          (iter-make (let ((derl--mailbox ())) (iter-yield-from fun))))
+         (process
+          (vector id (iter-make (let ((derl--mailbox ())) (iter-yield-from fun)))
+                  () nil ())))
     (puthash id process derl--processes)
     (derl--scheduler-schedule)
     id))
