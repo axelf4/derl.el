@@ -37,8 +37,8 @@
         result)
     (let ((proc
            (make-network-process
-            :name "epmd-port-req" :host 'local :service 4369 :plist (list 'buffer "")
-            :coding 'raw-text :filter-multibyte nil :filter
+            :name "epmd-port-req" :host 'local :service 4369
+            :plist (list 'buffer "") :coding 'binary :filter
             (lambda (proc string)
               (setq string (concat (process-get proc 'buffer) string))
               (if (length< string 4)
@@ -260,10 +260,9 @@
   (prog1 derl--next-ref (setq derl--next-ref (1+ derl--next-ref))))
 
 (defvar derl--scheduler-timer nil)
-
 (defun derl--scheduler-schedule ()
   (unless derl--scheduler-timer
-    (setq derl--scheduler-timer (run-with-timer 0 nil #'derl--scheduler-run))))
+    (setq derl--scheduler-timer (run-with-idle-timer 0 nil #'derl--scheduler-run))))
 
 (defun derl--scheduler-run ()
   (unless (= (derl-process-id derl--self) 0) (error "Scheduling from inferior process"))
@@ -273,8 +272,8 @@
                           unless (derl-process-blocked p) collect p))
                 (proc (and schedulable (nth (random (length schedulable)) schedulable))))
            (cond
-            ;; Main process is blocked on externalities
-            ((null schedulable) (accept-process-output nil 1))
+            ((null proc) ; Main process is blocked on externalities
+             (unless inhibit-quit (accept-process-output nil 30)))
             ;; Pass control back to main process
             ((= (derl-process-id proc) 0)
              (when (cdr schedulable) (derl--scheduler-schedule))
@@ -323,7 +322,6 @@
 
 (defun derl-send (pid expr &optional conn)
   "Send the message EXPR to PID, optionally over CONN."
-  (message "Sending %S to %S" expr pid)
   (if (null conn)
       (when-let (process (gethash pid derl--processes))
         (push expr (derl-process-mailbox process))
@@ -347,7 +345,6 @@
 
 (defun derl-exit (pid &rest args)
   "Signal the exit REASON to PID."
-  (message "Got thing for %S , %S" pid args)
   (when-let (process (gethash pid derl--processes))
     (push args (derl-process-exits process))
     (derl--scheduler-schedule)))
@@ -414,9 +411,8 @@
                              (derl-read))))
              (message "Parsed: %S" (cons control-msg msg))
              (pcase control-msg
-               ;; SEND_SENDER
                (`[22 ,_from-pid [,_ pid ,_name ,to-pid ,_serial ,_creation]]
-                (! to-pid msg))))))
+                (! to-pid msg)))))) ; SEND_SENDER
        (filter (proc string)
          (with-current-buffer (process-buffer proc)
            (insert string)
@@ -433,11 +429,13 @@
                    (funcall f proc)
                    (when (< (point) (point-max)) (error "Bad length")))
                  (delete-region (point-min) (+ (point-min) len)))))
-           (goto-char (point-max)))))
+           (goto-char (point-max))))
+       (sentinel (proc event)
+         (unless (process-live-p proc) (kill-buffer (process-buffer proc)))))
     (let* ((buf (generate-new-buffer " *erl recv*" t))
            (proc (make-network-process
                   :name "erl-emacs" :buffer buf :host host :service port
-                  :coding 'raw-text :filter-multibyte nil :filter #'filter
+                  :coding 'binary :filter #'filter :sentinel #'sentinel
                   :plist (list 'filter #'recv-status)))
            (flags
             (eval-when-compile
@@ -480,7 +478,7 @@
         (creation (process-get conn 'creation)))
     `[,derl-tag pid ,name ,id ,serial ,creation]))
 
-(defun derl-rpc (conn module function &rest args)
+(iter-defun derl-rpc (conn module function &rest args)
   "Apply FUNCTION in MODULE to ARGS on the remote node over CONN."
   (let ((pid (derl-self conn)))
     ;; {Who, {call, M, F, A, GroupLeader}}
@@ -493,7 +491,8 @@
   (let* ((self (derl-process-id derl--self))
          (ref (derl-make-ref))
          (pid (derl-spawn (iter-make (! self (cons ref (iter-yield-from fun)))))))
-    (with-timeout (1 (derl-exit pid #'signal 'normal nil) 'timeout)
+    ;; TODO
+    (with-timeout (5 (derl-exit pid #'signal 'normal nil) 'timeout)
       (derl-receive (`(,(pred (equal ref)) . ,x) x)))))
 
 (provide 'derl)
