@@ -23,8 +23,11 @@
   (should (equal (derl-term-to-binary 1.1337) "\203F?\362#\242\234w\232k")))
 
 (ert-deftest derl-ext-roundtrip-test ()
-  (should (let ((x [rex node]))
-            (equal (derl-binary-to-term (derl-term-to-binary x)) x))))
+  (let ((x [atom 0.1]))
+    (should (equal (derl-binary-to-term (derl-term-to-binary x)) x))))
+
+(ert-deftest derl-reference-unique-test ()
+  (should-not (equal (derl-make-ref) (derl-make-ref))))
 
 (ert-deftest derl-selective-receive-test ()
   (let* (result
@@ -35,7 +38,7 @@
     (should (equal result '(0 1)))))
 
 (ert-deftest derl-exit-normal-test ()
-  (let ((pid (derl-spawn (iter-make (derl-receive (x x))))))
+  (let ((pid (derl-spawn (iter-make (derl-receive (_))))))
     (derl-exit pid 'normal)
     (while (gethash pid derl--processes) (derl--scheduler-run))))
 

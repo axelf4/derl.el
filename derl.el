@@ -1,10 +1,22 @@
 ;;; derl.el --- Erlang distribution protocol implementation  -*- lexical-binding: t -*-
 
+;; Author: Axel Forsman <axel@axelf.se>
+;; Keywords: comm, processes, languages, extensions
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "29.1"))
+
 ;;; Commentary:
 
-;; Start with "erl -sname arnie" and get cookie
+;; This library implements the Erlang distribution protocol as
+;; described in
+;; https://www.erlang.org/doc/apps/erts/erl_dist_protocol.html.
+
+;; Start with "erl -sname arnie"
+
+;;; Code:
 
 (eval-when-compile (require 'cl-lib))
+(require 'pcase)
 (require 'generator)
 
 (eval-when-compile
@@ -50,7 +62,7 @@
                   (funcall
                    cb (if (/= result 0) (cons 'error result)
                         (logior (ash (aref string 2) 8) (aref string 3))))))) ; portno
-            :sentinel (lambda (proc event) (funcall cb (cons 'error event))))))
+            :sentinel (lambda (_proc event) (funcall cb (cons 'error event))))))
       (process-send-string
        proc (concat (derl--uint-string 2 (1+ (string-bytes name)))
                     [122] ; PORT_PLEASE2_REQ
@@ -62,7 +74,7 @@
 ;; Unless messages are passed between connected nodes and a
 ;; distribution header is used the first byte should contain the
 ;; version number.
-(defconst derl-ext-version 131)
+(defconst derl-ext-version 131 "Erlang external term format version magic.")
 
 (defconst derl-tag (make-symbol "ext-tag")
   "Marks the encompassing vector as a special Erlang term (i.e. not a tuple).")
@@ -96,7 +108,7 @@
               (id (read4))
               (serial (read4))
               (creation (read4)))
-         (vector derl-tag 'pid node id serial creation)))
+         `[,derl-tag pid ,node ,id ,serial ,creation]))
       ((or (and 104 (let n (progn (forward-char) (char-before)))) ; SMALL_TUPLE_EXT
            (and 105 (let n (read4)))) ; LARGE_TUPLE_EXT
        (cl-loop repeat n collect (derl-read) into xs
@@ -127,8 +139,9 @@
        (let* ((len (read2))
               (node (derl-read))
               (creation (read4))
-              (id (cl-loop repeat len collect (read4))))
-         (vector derl-tag 'reference node id creation)))
+              (id 0))
+         (dotimes (_ len) (setq id (logor (ash id 32) (read4))))
+         `[,derl-tag reference ,node ,id ,creation]))
 
       (70 ; NEW_FLOAT_EXT
        (let* ((x (read4))
@@ -216,14 +229,14 @@
            (insert 118) ; ATOM_UTF8_EXT
            (write4 n))
          (forward-char n)))
-      (_ (error "Cannot encode the term `%S'" term)))))
+      (_ (signal 'wrong-type-argument (list term))))))
 
 (defun derl-binary-to-term (&rest args)
   (with-temp-buffer
     (set-buffer-multibyte nil)
     (apply #'insert args)
     (goto-char (point-min))
-    (unless (eq (char-after) derl-ext-version) (error "Bad version"))
+    (unless (eq (get-byte) derl-ext-version) (error "Bad version"))
     (forward-char)
     (derl-read)))
 
@@ -244,10 +257,10 @@
 (defvar derl--self [0 nil () nil ()]
   "The current `derl-process'.")
 (defvar derl--mailbox ()
-  "The local chronological order mailbox of the current process.")
+  "Local chronological order mailbox of the current process.")
 
 (defvar derl--processes
-  (let ((table (make-hash-table :test 'eql)))
+  (let ((table (make-hash-table)))
     (puthash (derl-process-id derl--self) derl--self table)
     table)
   "Map of PID:s to processes.")
@@ -256,8 +269,13 @@
 
 (define-error 'normal "Normal exit" 'normal)
 
-(defun derl-make-ref ()
-  (prog1 derl--next-ref (setq derl--next-ref (1+ derl--next-ref))))
+(defun derl-make-ref (&optional conn)
+  "Return a unique reference."
+  (let ((id derl--next-ref) name creation)
+    (when (> (ash (cl-incf derl--next-ref) (* -5 32)) 0) (setq derl--next-ref 0))
+    (when conn (setq name (process-get conn 'name)
+                     creation (process-get conn 'creation)))
+    `[,derl-tag reference ,name ,id ,creation]))
 
 (defvar derl--scheduler-timer nil)
 (defun derl--scheduler-schedule ()
@@ -272,12 +290,10 @@
                           unless (derl-process-blocked p) collect p))
                 (proc (and schedulable (nth (random (length schedulable)) schedulable))))
            (cond
-            ((null proc) ; Main process is blocked on externalities
-             (unless inhibit-quit (accept-process-output nil 30)))
-            ;; Pass control back to main process
-            ((= (derl-process-id proc) 0)
-             (when (cdr schedulable) (derl--scheduler-schedule))
-             nil)
+            ((null proc) ; Blocked on externalities
+             (unless inhibit-quit (accept-process-output nil 30) t))
+            ((eq proc derl--self) ; Pass control back to main process
+             (when (cdr schedulable) (derl--scheduler-schedule) nil))
             (t (let ((id (derl-process-id proc)) (derl--self proc))
                  (condition-case err (iter-next (derl-process-function proc))
                    ((iter-end-of-sequence normal) (remhash id derl--processes))
@@ -298,12 +314,11 @@
   `(progn
      (unless (derl-process-exits derl--self)
        ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--scheduler-run)))
-     (dolist (x (prog1 (derl-process-exits derl--self)
-                  (setf (derl-process-exits derl--self) ())))
-       (apply (car x) (cdr x)))))
+     (when-let (x (pop (derl-process-exits derl--self))) (signal x nil))))
 
 (cl-defmacro derl-receive
     (&rest arms &aux (catchallp (cl-loop for (x) in arms thereis (symbolp x))))
+  "Wait for message matching one of ARMS and proceed with its action."
   (declare (debug (&rest (pcase-PAT body))))
   `(cl-loop
     for cell =
@@ -343,10 +358,11 @@
         [112] ; Pass through
         control-msg msg)))))
 
-(defun derl-exit (pid &rest args)
-  "Signal the exit REASON to PID."
+(defun derl-exit (pid reason)
+  "Send an exit signal with exit REASON to the process identified by PID."
   (when-let (process (gethash pid derl--processes))
-    (push args (derl-process-exits process))
+    (push reason (derl-process-exits process))
+    (setf (derl-process-blocked process) nil)
     (derl--scheduler-schedule)))
 
 ;;; Erlang Distribution Protocol
@@ -417,20 +433,19 @@
          (with-current-buffer (process-buffer proc)
            (insert string)
            (goto-char (point-min))
-           (let ((lenlen (if (eq (process-get proc 'filter) #'connected) 4 2))
-                 len)
-             (while (and (<= lenlen (buffer-size))
+           (let (lenlen len)
+             (while (and (<= (setq lenlen (if (eq (process-get proc 'filter) #'connected) 4 2))
+                             (buffer-size))
                          (<= (setq len (+ lenlen (if (= lenlen 4) (derl--read-uint 4)
                                                    (derl--read-uint 2))))
                              (buffer-size)))
-               (let ((f (process-get proc 'filter)))
-                 (save-restriction
-                   (narrow-to-region (point) (+ (point-min) len))
-                   (funcall f proc)
-                   (when (< (point) (point-max)) (error "Bad length")))
-                 (delete-region (point-min) (+ (point-min) len)))))
+               (save-restriction
+                 (narrow-to-region (point) (+ (point-min) len))
+                 (funcall (process-get proc 'filter) proc)
+                 (when (< (point) (point-max)) (error "Bad length")))
+               (delete-region (point-min) (point))))
            (goto-char (point-max))))
-       (sentinel (proc event)
+       (sentinel (proc _event)
          (unless (process-live-p proc) (kill-buffer (process-buffer proc)))))
     (let* ((buf (generate-new-buffer " *erl recv*" t))
            (proc (make-network-process
@@ -457,9 +472,7 @@
                   (ash 1 33) ; DFLAG_NAME_ME
                   (ash 1 34))))) ; DFLAG_V4_NC
            (name (system-name)))
-      (with-current-buffer buf
-        (set-buffer-multibyte nil)
-        (buffer-disable-undo))
+      (with-current-buffer buf (set-buffer-multibyte nil))
       ;; Send send_name message
       (process-send-string
        proc (concat (derl--uint-string 2 (+ 15 (string-bytes name))) ; Length
@@ -487,12 +500,11 @@
 
 ;; For simplicity this function may only be called from the main process
 (defun derl--call (fun)
-  "Delegate to generator FUN ensuring that spam is blocked."
+  "Delegate to generator FUN with a timeout, dropping any laggard messages."
   (let* ((self (derl-process-id derl--self))
          (ref (derl-make-ref))
          (pid (derl-spawn (iter-make (! self (cons ref (iter-yield-from fun)))))))
-    ;; TODO
-    (with-timeout (5 (derl-exit pid #'signal 'normal nil) 'timeout)
+    (with-timeout (5 (derl-exit pid 'normal) 'timeout)
       (derl-receive (`(,(pred (equal ref)) . ,x) x)))))
 
 (provide 'derl)
