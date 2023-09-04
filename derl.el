@@ -159,6 +159,10 @@
        (intern (decode-coding-region (- (point) n) (point) 'utf-8 t)))
       (tag (error "Unknown tag `%s'" tag)))))
 
+(defvar derl--write-connection)
+(put 'derl--write-connection 'variable-documentation
+     "The current connection during `derl-write'.")
+
 (defun derl-write (term)
   "Print TERM at point according to the Erlang external term format."
   (cl-labels
@@ -181,6 +185,10 @@
                         (insert 111) ; LARGE_BIG_EXT
                         (write4 n)))))))
       (`[,(pred (eq derl-tag)) pid ,node ,id ,serial ,creation]
+       (unless node
+         (setq node (process-get derl--write-connection 'name)
+               serial 0
+               creation (process-get derl--write-connection 'creation)))
        (insert 88) ; NEW_PID_EXT
        (derl-write node)
        (write4 id)
@@ -269,13 +277,15 @@
 
 (define-error 'normal "Normal exit" 'normal)
 
-(defun derl-make-ref (&optional conn)
+(defun derl-self ()
+  "Return a process identifier of the calling process."
+  `[,derl-tag pid nil ,(derl-process-id derl--self) nil nil])
+
+(defun derl-make-ref ()
   "Return a unique reference."
-  (let ((id derl--next-ref) name creation)
+  (let ((id derl--next-ref))
     (when (> (ash (cl-incf derl--next-ref) (* -5 32)) 0) (setq derl--next-ref 0))
-    (when conn (setq name (process-get conn 'name)
-                     creation (process-get conn 'creation)))
-    `[,derl-tag reference ,name ,id ,creation]))
+    `[,derl-tag reference nil ,id nil]))
 
 (defvar derl--scheduler-timer nil)
 (defun derl--scheduler-schedule ()
@@ -335,28 +345,27 @@
     finally (if prev (setcdr prev (cdr cell)) (pop derl--mailbox))
     finally return result))
 
-(defun derl-send (pid expr &optional conn)
-  "Send the message EXPR to PID, optionally over CONN."
-  (if (null conn)
-      (when-let (process (gethash pid derl--processes))
-        (push expr (derl-process-mailbox process))
-        (derl--scheduler-schedule)
-        (setf (derl-process-blocked process) nil))
-    (let* ((from (derl-self conn))
-           (control-msg
-            (derl-term-to-binary
-             (if (symbolp pid) `[6 ,from nil ,pid] ; REG_SEND
-               (let* ((name (process-get conn 'name-b))
-                      (creation (process-get conn 'creation-b))
-                      (to `[,derl-tag pid ,name ,pid 0 ,creation]))
-                 `[22 ,from ,to])))) ; SEND_SENDER
-           (msg (derl-term-to-binary expr)))
-      (process-send-string
-       conn
-       (concat
-        (derl--uint-string 4 (+ 1 (string-bytes control-msg) (string-bytes msg)))
-        [112] ; Pass through
-        control-msg msg)))))
+(defun derl-send (dest msg)
+  "Send MSG to DEST and return MSG.
+DEST can be a remote or local process identifier, or a tuple
+\(REG_NAME . NODE) for a registered name at another node."
+  (when-let
+      (process
+       (pcase-exhaustive dest
+         ((or (and (pred natnump) id) `[,_ pid nil ,id ,_ ,_])
+          (gethash id derl--processes))
+         ((or (and `(,pid . ,node) (let ctl `[6 ,(derl-self) nil ,pid])) ; REG_SEND
+              (and `[,_ pid ,node ,pid ,_ ,_]
+                   (let ctl `[22 ,(derl-self) ,dest]))) ; SEND_SENDER
+          (when-let (conn (gethash node derl--connections))
+            (if (eq node (process-get conn 'name))
+                (if (symbolp pid) nil (gethash pid derl--processes))
+              (derl--send-control-msg conn ctl msg)
+              nil)))))
+    (push msg (derl-process-mailbox process))
+    (setf (derl-process-blocked process) nil)
+    (derl--scheduler-schedule))
+  msg)
 
 (defun derl-exit (pid reason)
   "Send an exit signal with exit REASON to the process identified by PID."
@@ -366,6 +375,9 @@
     (derl--scheduler-schedule)))
 
 ;;; Erlang Distribution Protocol
+
+(defvar derl--connections (make-hash-table :test 'eq :weakness 'value)
+  "Map from Erlang node names to connections.")
 
 (defun derl--gen-digest (challenge cookie)
   "Generate a message digest (the \"gen_digest()\" function)."
@@ -411,6 +423,8 @@
          (unless (eq (get-byte) ?a) (error "Bad tag"))
          (let ((digest (buffer-substring-no-properties (1+ (point)) (+ (point) 1 16))))
            (forward-char 17)
+           (puthash (process-get proc 'name) proc derl--connections)
+           (puthash (process-get proc 'name-b) proc derl--connections)
            (message "Got challenge ACK: digest %S!" digest)
            (process-put proc 'filter #'connected)))
        (connected (proc)
@@ -483,25 +497,28 @@
                     name))
       proc)))
 
-(defun derl-self (conn)
-  "Return an Erlang PID object for this process on the node connection CONN."
-  (let ((name (process-get conn 'name))
-        (id (derl-process-id derl--self))
-        (serial 0)
-        (creation (process-get conn 'creation)))
-    `[,derl-tag pid ,name ,id ,serial ,creation]))
+(defun derl--send-control-msg (conn control-msg &optional msg)
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert 112 derl-ext-version) ; Pass through
+    (let ((derl--write-connection conn))
+      (derl-write control-msg)
+      (when msg (insert derl-ext-version) (derl-write msg)))
+    (goto-char (point-min))
+    (insert (derl--uint-string 4 (buffer-size)))
+    (process-send-region conn (point-min) (point-max))))
 
-(iter-defun derl-rpc (conn module function &rest args)
-  "Apply FUNCTION in MODULE to ARGS on the remote node over CONN."
-  (let ((pid (derl-self conn)))
-    ;; {Who, {call, M, F, A, GroupLeader}}
-    (! 'rex `[,pid [call ,module ,function ,args ,pid]] conn))
+(iter-defun derl-rpc (node module function args)
+  "Apply FUNCTION in MODULE to ARGS on the remote NODE."
+  (! `(rex . ,node)
+     ;; {Who, {call, M, F, A, GroupLeader}}
+     (let ((pid (derl-self))) `[,pid [call ,module ,function ,args ,pid]]))
   (derl-receive (`[rex ,x] x)))
 
 ;; For simplicity this function may only be called from the main process
 (defun derl--call (fun &optional timeout)
   "Delegate to generator FUN with TIMEOUT, dropping any laggard messages."
-  (let* ((self (derl-process-id derl--self))
+  (let* ((self (derl-self))
          (ref (derl-make-ref))
          (pid (derl-spawn
                (lambda (op value)
