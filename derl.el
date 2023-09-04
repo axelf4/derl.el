@@ -432,17 +432,20 @@ DEST can be a remote or local process identifier, or a tuple
              (process-send-string proc "\0\0\0\0") ; Zero-length heartbeat
            (cl-assert (eq (get-byte) 112)) ; Check that type is pass through
            (forward-char)
-           (let ((control-msg
-                  (progn (cl-assert (eq (get-byte) derl-ext-version))
-                         (forward-char)
-                         (derl-read)))
-                 (msg (progn (cl-assert (eq (get-byte) derl-ext-version))
+           (let ((ctl (progn (cl-assert (eq (get-byte) derl-ext-version))
                              (forward-char)
-                             (derl-read))))
-             (message "Parsed: %S" (cons control-msg msg))
-             (pcase control-msg
-               (`[22 ,_from-pid [,_ pid ,_name ,to-pid ,_serial ,_creation]]
-                (! to-pid msg)))))) ; SEND_SENDER
+                             (derl-read)))
+                 (msg (unless (eobp)
+                        (cl-assert (eq (get-byte) derl-ext-version))
+                        (forward-char)
+                        (derl-read))))
+             (message "Parsed: %S" (cons ctl msg))
+             (pcase ctl
+               (`[6 ,_from ,_ ,to]) ; REG_SEND
+               (`[22 ,_from [,_ pid ,_name ,to ,_serial ,_creation]] ; SEND_SENDER
+                (! to msg))
+               (`[,(or 3 8) ,from [,_ pid ,_name ,to ,_serial ,_creation] ,reason]
+                (derl-exit to reason)))))) ; EXIT/EXIT2
        (filter (proc string)
          (with-current-buffer (process-buffer proc)
            (insert string)
