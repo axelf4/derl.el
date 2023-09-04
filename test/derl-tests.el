@@ -42,6 +42,9 @@
     (derl-exit pid 'normal)
     (while (gethash pid derl--processes) (derl--scheduler-run))))
 
+(ert-deftest derl-timeout-test ()
+  (should (eq (derl--call (iter-make (derl-receive (_))) 0) 'timeout)))
+
 ;; Local Variables:
 ;; read-symbol-shorthands: (("!" . "derl-send"))
 ;; End:

@@ -499,12 +499,16 @@
   (derl-receive (`[rex ,x] x)))
 
 ;; For simplicity this function may only be called from the main process
-(defun derl--call (fun)
-  "Delegate to generator FUN with a timeout, dropping any laggard messages."
+(defun derl--call (fun &optional timeout)
+  "Delegate to generator FUN with TIMEOUT, dropping any laggard messages."
   (let* ((self (derl-process-id derl--self))
          (ref (derl-make-ref))
-         (pid (derl-spawn (iter-make (! self (cons ref (iter-yield-from fun)))))))
-    (with-timeout (5 (derl-exit pid 'normal) 'timeout)
+         (pid (derl-spawn
+               (lambda (op value)
+                 (condition-case err (funcall fun op value)
+                   (iter-end-of-sequence (! self (cons ref (cdr err)))
+                                         (signal (car err) (cdr err))))))))
+    (with-timeout ((or timeout 5) (derl-exit pid 'normal) 'timeout)
       (derl-receive (`(,(pred (equal ref)) . ,x) x)))))
 
 (provide 'derl)
