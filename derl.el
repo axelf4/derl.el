@@ -326,8 +326,7 @@
        ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--scheduler-run)))
      (when-let (x (pop (derl-process-exits derl--self))) (signal x nil))))
 
-(cl-defmacro derl-receive
-    (&rest arms &aux (catchallp (cl-loop for (x) in arms thereis (symbolp x))))
+(defmacro derl-receive (&rest arms)
   "Wait for message matching one of ARMS and proceed with its action."
   (declare (debug (&rest (pcase-PAT body))))
   `(cl-loop
@@ -340,7 +339,9 @@
             (if cell (setcdr cell xs) (setq derl--mailbox xs)))))
     and prev = cell with result while
     (let ((continue nil))
-      (setq result (pcase (car cell) ,@arms ,@(unless catchallp '((_ (setq continue t))))))
+      (setq result ,(let* ((x (gensym "_"))
+                           (pcase--dontwarn-upats (cons x pcase--dontwarn-upats)))
+                      (pcase--expand '(car cell) `(,@arms (,x (setq continue t))))))
       continue)
     finally (if prev (setcdr prev (cdr cell)) (pop derl--mailbox))
     finally return result))
