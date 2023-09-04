@@ -511,6 +511,14 @@ DEST can be a remote or local process identifier, or a tuple
     (insert (derl--uint-string 4 (buffer-size)))
     (process-send-region conn (point-min) (point-max))))
 
+(cl-defun derl-cookie (&aux file)
+  (when (or (file-exists-p (setq file "~/.erlang.cookie"))
+            (file-exists-p
+             (setq file (concat (or (getenv "XDG_CONFIG_HOME") "~/.config")
+                                "/erlang/.erlang.cookie"))))
+    (with-temp-buffer (insert-file-contents-literally file)
+                      (buffer-string))))
+
 (iter-defun derl-rpc (node module function args)
   "Apply FUNCTION in MODULE to ARGS on the remote NODE."
   (! `(rex . ,node)
