@@ -93,7 +93,11 @@
          (let ((p (point)))
            (forward-char 4)
            (logior (ash (get-byte p) 24) (ash (get-byte (1+ p)) 16)
-                   (ash (get-byte (+ p 2)) 8) (get-byte (+ p 3))))))
+                   (ash (get-byte (+ p 2)) 8) (get-byte (+ p 3)))))
+       (internal-p (node creation)
+         (let ((conn (gethash node derl--connections)))
+           (and (eq node (process-get conn 'name))
+                (= creation (process-get conn 'creation))))))
     (forward-char)
     (pcase (char-before)
       (97 ; SMALL_INTEGER_EXT
@@ -104,10 +108,8 @@
          (- (logand u #x7fffffff) (logand u #x80000000))))
 
       (88 ; NEW_PID_EXT
-       (let* ((node (derl-read))
-              (id (read4))
-              (serial (read4))
-              (creation (read4)))
+       (let ((node (derl-read)) (id (read4)) (serial (read4)) (creation (read4)))
+         (when (internal-p node creation) (setq node nil creation nil))
          `[,derl-tag pid ,node ,id ,serial ,creation]))
       ((or (and 104 (let n (progn (forward-char) (char-before)))) ; SMALL_TUPLE_EXT
            (and 105 (let n (read4)))) ; LARGE_TUPLE_EXT
@@ -136,11 +138,9 @@
                 (forward-char)
                 finally return (if (= sign 0) x (- x))))
       (90 ; NEWER_REFERENCE_EXT
-       (let* ((len (read2))
-              (node (derl-read))
-              (creation (read4))
-              (id 0))
+       (let ((len (read2)) (node (derl-read)) (creation (read4)) (id 0))
          (dotimes (_ len) (setq id (logor (ash id 32) (read4))))
+         (when (internal-p node creation) (setq node nil creation nil))
          `[,derl-tag reference ,node ,id ,creation]))
 
       (70 ; NEW_FLOAT_EXT
@@ -360,7 +360,7 @@ DEST can be a remote or local process identifier, or a tuple
                    (let ctl `[22 ,(derl-self) ,dest]))) ; SEND_SENDER
           (when-let (conn (gethash node derl--connections))
             (if (eq node (process-get conn 'name))
-                (if (symbolp pid) nil (gethash pid derl--processes))
+                (when (symbolp pid) nil) ; TODO
               (derl--send-control-msg conn ctl msg)
               nil)))))
     (push msg (derl-process-mailbox process))
