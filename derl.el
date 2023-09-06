@@ -257,19 +257,19 @@
 
 ;;; Erlang-like processes
 
-(cl-defstruct (derl-process (:type vector) (:constructor nil)
-                            (:copier nil) (:predicate nil))
+(cl-defstruct (derl--process (:type vector) (:constructor nil)
+                             (:copier nil) (:predicate nil))
   (id (:read-only t)) (function (:read-only t)) mailbox blocked exits)
 
 ;; Process-local variables
 (defvar derl--self [0 nil () nil ()]
-  "The current `derl-process'.")
+  "The current `derl--process'.")
 (defvar derl--mailbox ()
   "Local chronological order mailbox of the current process.")
 
 (defvar derl--processes
   (let ((table (make-hash-table)))
-    (puthash (derl-process-id derl--self) derl--self table)
+    (puthash (derl--process-id derl--self) derl--self table)
     table)
   "Map of PID:s to processes.")
 (defvar derl--next-pid 0)
@@ -279,7 +279,7 @@
 
 (defun derl-self ()
   "Return a process identifier of the calling process."
-  `[,derl-tag pid nil ,(derl-process-id derl--self) nil nil])
+  `[,derl-tag pid nil ,(derl--process-id derl--self) nil nil])
 
 (defun derl-make-ref ()
   "Return a unique reference."
@@ -293,19 +293,19 @@
     (setq derl--scheduler-timer (run-with-idle-timer 0 nil #'derl--run))))
 
 (defun derl--run ()
-  (unless (= (derl-process-id derl--self) 0) (error "Scheduling from inferior process"))
+  (unless (= (derl--process-id derl--self) 0) (error "Scheduling from inferior process"))
   (setq derl--scheduler-timer nil)
   (while (let* ((schedulable
                  (cl-loop for p being the hash-values of derl--processes
-                          unless (derl-process-blocked p) collect p))
+                          unless (derl--process-blocked p) collect p))
                 (proc (and schedulable (nth (random (length schedulable)) schedulable))))
            (cond
             ((null proc) ; Blocked on externalities
              (unless inhibit-quit (accept-process-output nil 30) t))
             ((eq proc derl--self) ; Pass control back to main process
              (when (cdr schedulable) (derl--schedule) nil))
-            (t (let ((id (derl-process-id proc)) (derl--self proc))
-                 (condition-case err (iter-next (derl-process-function proc))
+            (t (let ((id (derl--process-id proc)) (derl--self proc))
+                 (condition-case err (iter-next (derl--process-function proc))
                    ((iter-end-of-sequence normal) (remhash id derl--processes))
                    (t (remhash id derl--processes)
                       (message "Process %d exited with error: %S" id err))))
@@ -322,9 +322,9 @@
 
 (cl-defmacro derl-yield (&environment env)
   `(progn
-     (unless (derl-process-exits derl--self)
+     (unless (derl--process-exits derl--self)
        ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--run)))
-     (when-let (x (pop (derl-process-exits derl--self))) (signal x nil))))
+     (when-let (x (pop (derl--process-exits derl--self))) (signal x nil))))
 
 (defmacro derl-receive (&rest arms)
   "Wait for message matching one of ARMS and proceed with its action."
@@ -332,10 +332,10 @@
   `(cl-loop
     for cell =
     (or (if cell (cdr cell) derl--mailbox)
-        (cl-letf (((derl-process-blocked derl--self) t))
-          (while (null (derl-process-mailbox derl--self)) (derl-yield))
-          (let ((xs (nreverse (derl-process-mailbox derl--self))))
-            (setf (derl-process-mailbox derl--self) ())
+        (cl-letf (((derl--process-blocked derl--self) t))
+          (while (null (derl--process-mailbox derl--self)) (derl-yield))
+          (let ((xs (nreverse (derl--process-mailbox derl--self))))
+            (setf (derl--process-mailbox derl--self) ())
             (if cell (setcdr cell xs) (setq derl--mailbox xs)))))
     and prev = cell with result while
     (let ((continue nil))
@@ -363,16 +363,16 @@ DEST can be a remote or local process identifier, or a tuple
                 (when (symbolp pid) nil) ; TODO
               (derl--send-control-msg conn ctl msg)
               nil)))))
-    (push msg (derl-process-mailbox process))
-    (setf (derl-process-blocked process) nil)
+    (push msg (derl--process-mailbox process))
+    (setf (derl--process-blocked process) nil)
     (derl--schedule))
   msg)
 
 (defun derl-exit (pid reason)
   "Send an exit signal with exit REASON to the process identified by PID."
   (when-let (process (gethash pid derl--processes))
-    (push reason (derl-process-exits process))
-    (setf (derl-process-blocked process) nil)
+    (push reason (derl--process-exits process))
+    (setf (derl--process-blocked process) nil)
     (derl--schedule)))
 
 ;;; Erlang Distribution Protocol
