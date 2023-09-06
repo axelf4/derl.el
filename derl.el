@@ -288,11 +288,11 @@
     `[,derl-tag reference nil ,id nil]))
 
 (defvar derl--scheduler-timer nil)
-(defun derl--scheduler-schedule ()
+(defun derl--schedule ()
   (unless derl--scheduler-timer
-    (setq derl--scheduler-timer (run-with-idle-timer 0 nil #'derl--scheduler-run))))
+    (setq derl--scheduler-timer (run-with-idle-timer 0 nil #'derl--run))))
 
-(defun derl--scheduler-run ()
+(defun derl--run ()
   (unless (= (derl-process-id derl--self) 0) (error "Scheduling from inferior process"))
   (setq derl--scheduler-timer nil)
   (while (let* ((schedulable
@@ -303,7 +303,7 @@
             ((null proc) ; Blocked on externalities
              (unless inhibit-quit (accept-process-output nil 30) t))
             ((eq proc derl--self) ; Pass control back to main process
-             (when (cdr schedulable) (derl--scheduler-schedule) nil))
+             (when (cdr schedulable) (derl--schedule) nil))
             (t (let ((id (derl-process-id proc)) (derl--self proc))
                  (condition-case err (iter-next (derl-process-function proc))
                    ((iter-end-of-sequence normal) (remhash id derl--processes))
@@ -317,13 +317,13 @@
               (let ((derl--mailbox m))
                 (unwind-protect (funcall fun op value) (setq m derl--mailbox))))))
     (puthash id (vector id f () nil ()) derl--processes)
-    (derl--scheduler-schedule)
+    (derl--schedule)
     id))
 
 (cl-defmacro derl-yield (&environment env)
   `(progn
      (unless (derl-process-exits derl--self)
-       ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--scheduler-run)))
+       ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--run)))
      (when-let (x (pop (derl-process-exits derl--self))) (signal x nil))))
 
 (defmacro derl-receive (&rest arms)
@@ -365,7 +365,7 @@ DEST can be a remote or local process identifier, or a tuple
               nil)))))
     (push msg (derl-process-mailbox process))
     (setf (derl-process-blocked process) nil)
-    (derl--scheduler-schedule))
+    (derl--schedule))
   msg)
 
 (defun derl-exit (pid reason)
@@ -373,7 +373,7 @@ DEST can be a remote or local process identifier, or a tuple
   (when-let (process (gethash pid derl--processes))
     (push reason (derl-process-exits process))
     (setf (derl-process-blocked process) nil)
-    (derl--scheduler-schedule)))
+    (derl--schedule)))
 
 ;;; Erlang Distribution Protocol
 

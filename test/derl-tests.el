@@ -34,13 +34,13 @@
          (pid (derl-spawn
                (iter-make (derl-receive (2)) (setq result derl--mailbox)))))
     (dotimes (i 3) (! pid i))
-    (while (null result) (derl--scheduler-run))
+    (while (null result) (derl--run))
     (should (equal result '(0 1)))))
 
 (ert-deftest derl-exit-normal-test ()
   (let ((pid (derl-spawn (iter-make (derl-receive (_))))))
     (derl-exit pid 'normal)
-    (while (gethash pid derl--processes) (derl--scheduler-run))))
+    (while (gethash pid derl--processes) (derl--run))))
 
 (ert-deftest derl-timeout-test ()
   (should (eq (derl--call (iter-make (derl-receive (_))) 0) 'timeout)))
