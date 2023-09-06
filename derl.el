@@ -396,7 +396,7 @@ DEST can be a remote or local process identifier, or a tuple
                   (name (progn (forward-char nlen)
                                (buffer-substring-no-properties (- (point) nlen) (point))))
                   (creation (derl--read-uint 4)))
-             (message "Name: %s, creation: %s" name creation)
+             (message "Name: %s, creation: %d" name creation)
              (process-put proc 'name (intern name))
              (process-put proc 'creation creation)
              (process-put proc 'filter #'recv-challenge)))
@@ -414,6 +414,7 @@ DEST can be a remote or local process identifier, or a tuple
                 (digest (derl--gen-digest challenge-b cookie)))
            (process-put proc 'name-b (intern name-b))
            (process-put proc 'creation-b creation-b)
+           (process-put proc 'challenge-a challenge-a)
            (process-send-string
             proc (concat [0 21 ; Length
                             ?r] ; send_challenge_reply tag
@@ -422,11 +423,14 @@ DEST can be a remote or local process identifier, or a tuple
            (process-put proc 'filter #'recv-challenge-ack)))
        (recv-challenge-ack (proc)
          (unless (eq (get-byte) ?a) (error "Bad tag"))
-         (let ((digest (buffer-substring-no-properties (1+ (point)) (+ (point) 1 16))))
+         (let ((challenge-a (process-get proc 'challenge-a))
+               (digest (buffer-substring-no-properties (1+ (point)) (+ (point) 1 16))))
            (forward-char 17)
+           (unless (string= (derl--gen-digest challenge-a cookie) digest)
+             (error "Bad digest"))
+           (message "Got challenge ACK!")
            (puthash (process-get proc 'name) proc derl--connections)
            (puthash (process-get proc 'name-b) proc derl--connections)
-           (message "Got challenge ACK: digest %S!" digest)
            (process-put proc 'filter #'connected)))
        (connected (proc)
          (if (= (point-min) (point-max))
