@@ -187,7 +187,6 @@
       (`[,(pred (eq derl-tag)) pid ,node ,id ,serial ,creation]
        (unless node
          (setq node (process-get derl--write-connection 'name)
-               serial 0
                creation (process-get derl--write-connection 'creation)))
        (insert 88) ; NEW_PID_EXT
        (derl-write node)
@@ -262,8 +261,7 @@
   (id (:read-only t)) (function (:read-only t)) mailbox blocked exits)
 
 ;; Process-local variables
-(defvar derl--self [0 nil () nil ()]
-  "The current `derl--process'.")
+(defvar derl--self [0 nil () nil ()] "The current `derl--process'.")
 (defvar derl--mailbox ()
   "Local chronological order mailbox of the current process.")
 
@@ -272,6 +270,7 @@
     (puthash (derl--process-id derl--self) derl--self table)
     table)
   "Map of PID:s to processes.")
+(defvar derl--registry (make-hash-table :test 'eq) "Process registry.")
 (defvar derl--next-pid 0)
 (defvar derl--next-ref 0)
 
@@ -279,13 +278,24 @@
 
 (defun derl-self ()
   "Return a process identifier of the calling process."
-  `[,derl-tag pid nil ,(derl--process-id derl--self) nil nil])
+  `[,derl-tag pid nil ,(derl--process-id derl--self) 0 nil])
 
 (defun derl-make-ref ()
   "Return a unique reference."
   (let ((id derl--next-ref))
     (when (> (ash (cl-incf derl--next-ref) (* -5 32)) 0) (setq derl--next-ref 0))
     `[,derl-tag reference nil ,id nil]))
+
+(defun derl-register (name pid)
+  (pcase pid
+    ((and `[,_ pid nil ,id ,_ nil] (guard (gethash id derl--processes)))
+     (puthash name id derl--registry))
+    (_ (signal 'wrong-type-argument (list pid)))))
+
+(defun derl-whereis (name)
+  (when-let ((id (gethash name derl--registry))
+             ((gethash id derl--processes)))
+    `[,derl-tag pid nil ,id 0 nil]))
 
 (defvar derl--scheduler-timer nil)
 (defun derl--schedule ()
@@ -318,7 +328,7 @@
                 (unwind-protect (funcall fun op value) (setq m derl--mailbox))))))
     (puthash id (vector id f () nil ()) derl--processes)
     (derl--schedule)
-    id))
+    `[,derl-tag pid nil ,id 0 nil]))
 
 (cl-defmacro derl-yield (&environment env)
   `(progn
@@ -348,21 +358,22 @@
 
 (defun derl-send (dest msg)
   "Send MSG to DEST and return MSG.
-DEST can be a remote or local process identifier, or a tuple
-\(REG_NAME . NODE) for a registered name at another node."
+DEST can be a remote or local process identifier, a locally registered
+name, or a tuple \(REG-NAME . NODE) for a name at another node."
   (when-let
-      (process
-       (pcase-exhaustive dest
-         ((or (and (pred natnump) id) `[,_ pid nil ,id ,_ ,_])
-          (gethash id derl--processes))
-         ((or (and `(,pid . ,node) (let ctl `[6 ,(derl-self) nil ,pid])) ; REG_SEND
-              (and `[,_ pid ,node ,pid ,_ ,_]
-                   (let ctl `[22 ,(derl-self) ,dest]))) ; SEND_SENDER
-          (when-let (conn (gethash node derl--connections))
-            (if (eq node (process-get conn 'name))
-                (when (symbolp pid) nil) ; TODO
-              (derl--send-control-msg conn ctl msg)
-              nil)))))
+      ((id (pcase-exhaustive dest
+             (`[,_ pid nil ,id ,_ nil] id)
+             ((pred symbolp) (gethash dest derl--registry))
+             ((or (and `(,name . ,node)
+                       (let ctl `[6 ,(derl-self) nil ,name])) ; REG_SEND
+                  (and `[,_ pid ,node ,_ ,_ ,_]
+                       (let ctl `[22 ,(derl-self) ,dest]))) ; SEND_SENDER
+              (when-let (conn (gethash node derl--connections))
+                (if (eq node (process-get conn 'name))
+                    (when name (gethash name derl--registry))
+                  (derl--send-control-msg conn ctl msg)
+                  nil)))))
+       (process (gethash id derl--processes)))
     (push msg (derl--process-mailbox process))
     (setf (derl--process-blocked process) nil)
     (derl--schedule))
@@ -370,7 +381,9 @@ DEST can be a remote or local process identifier, or a tuple
 
 (defun derl-exit (pid reason)
   "Send an exit signal with exit REASON to the process identified by PID."
-  (when-let (process (gethash pid derl--processes))
+  ;; TODO Support external process identifiers
+  (when-let (process (pcase-exhaustive pid
+                       (`[,_ pid nil ,id ,_ nil] (gethash id derl--processes))))
     (push reason (derl--process-exits process))
     (setf (derl--process-blocked process) nil)
     (derl--schedule)))
@@ -446,11 +459,9 @@ DEST can be a remote or local process identifier, or a tuple
                         (derl-read))))
              (message "Parsed: %S" (cons ctl msg))
              (pcase ctl
-               (`[6 ,_from ,_ ,to]) ; REG_SEND
-               (`[22 ,_from [,_ pid ,_name ,to ,_serial ,_creation]] ; SEND_SENDER
-                (! to msg))
-               (`[,(or 3 8) ,from [,_ pid ,_name ,to ,_serial ,_creation] ,reason]
-                (derl-exit to reason)))))) ; EXIT/EXIT2
+               (`[22 ,_from ,to] (! to msg)) ; SEND_SENDER
+               (`[,(or 3 8) ,from ,to ,reason] (derl-exit to reason)) ; EXIT/EXIT2
+               (`[6 ,_from ,_ ,to] (! to msg)))))) ; REG_SEND
        (filter (proc string)
          (with-current-buffer (process-buffer proc)
            (insert string)
