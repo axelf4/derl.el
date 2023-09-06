@@ -369,8 +369,8 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
                   (and `[,_ pid ,node ,_ ,_ ,_]
                        (let ctl `[22 ,(derl-self) ,dest]))) ; SEND_SENDER
               (when-let (conn (gethash node derl--connections))
-                (if (eq node (process-get conn 'name))
-                    (when name (gethash name derl--registry))
+                (if (and name (eq node (process-get conn 'name)))
+                    (gethash name derl--registry)
                   (derl--send-control-msg conn ctl msg)
                   nil)))))
        (process (gethash id derl--processes)))
@@ -381,12 +381,14 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
 
 (defun derl-exit (pid reason)
   "Send an exit signal with exit REASON to the process identified by PID."
-  ;; TODO Support external process identifiers
-  (when-let (process (pcase-exhaustive pid
-                       (`[,_ pid nil ,id ,_ nil] (gethash id derl--processes))))
-    (push reason (derl--process-exits process))
-    (setf (derl--process-blocked process) nil)
-    (derl--schedule)))
+  (pcase-let ((`[,_ pid ,node ,id ,_ ,_] pid))
+    (if node
+        (when-let (conn (gethash node derl--connections))
+          (derl--send-control-msg conn `[8 ,(derl-self) ,pid ,reason])) ; EXIT2
+      (when-let (process (gethash id derl--processes))
+        (push reason (derl--process-exits process))
+        (setf (derl--process-blocked process) nil)
+        (derl--schedule)))))
 
 ;;; Erlang Distribution Protocol
 
