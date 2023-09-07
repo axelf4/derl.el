@@ -29,6 +29,13 @@
 (ert-deftest derl-reference-unique-test ()
   (should-not (equal (derl-make-ref) (derl-make-ref))))
 
+(ert-deftest derl-name-registry-test ()
+  (unwind-protect
+      (progn (derl-register 'foo (derl-self))
+             (should (equal (derl-whereis 'foo) (derl-self))))
+    (derl-register 'foo nil))
+  (should (null (derl-whereis 'foo))))
+
 (ert-deftest derl-selective-receive-test ()
   (let* (result
          (pid (derl-spawn

@@ -293,16 +293,15 @@ return the port in a blocking fashion."
 
 (defun derl-register (name pid)
   "Register a symbol NAME with PID in the name registry."
-  (pcase pid
+  (pcase-exhaustive pid
     ((and `[,_ pid nil ,id ,_ nil] (guard (gethash id derl--processes)))
      (puthash name id derl--registry))
-    (_ (signal 'wrong-type-argument (list pid)))))
+    ('nil (remhash name derl--registry))))
 
 (defun derl-whereis (name)
   "Return the process identifier with the registered NAME, or nil if none exists."
-  (when-let ((id (gethash name derl--registry))
-             ((gethash id derl--processes)))
-    `[,derl-tag pid nil ,id 0 nil]))
+  (let ((id (gethash name derl--registry)))
+    (and id (gethash id derl--processes) `[,derl-tag pid nil ,id 0 nil])))
 
 (defvar derl--scheduler-timer nil)
 (defun derl--schedule ()
