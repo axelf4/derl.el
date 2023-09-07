@@ -1,7 +1,7 @@
 ;;; derl.el --- Erlang distribution protocol implementation  -*- lexical-binding: t -*-
 
 ;; Author: Axel Forsman <axel@axelf.se>
-;; Keywords: comm, processes, languages, extensions
+;; Keywords: comm, extensions, languages, processes
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1"))
 
@@ -40,16 +40,19 @@
 
 ;;; Erlang Port Mapper Daemon (EPMD) interaction
 
-(defun derl-epmd-port-please (name &optional cb)
-  "Get the distribution port of the node NAME."
-  (if (null cb)
+(defun derl-epmd-port-please (name &optional callback)
+  "Get the distribution port of the node NAME.
+If non-nil CALLBACK, return the network process and call CALLBACK
+asynchronously with the port, nil indicating an error. Otherwise,
+return the port in a blocking fashion."
+  (if (null callback)
       (let* (result
              (proc (derl-epmd-port-please name (lambda (x) (setq result x)))))
         (while (accept-process-output proc))
         result)
     (let ((proc
            (make-network-process
-            :name "epmd-port-req" :host 'local :service 4369
+            :name "epmd-port-please-req" :host 'local :service 4369
             :plist (list 'buffer "") :coding 'binary :filter
             (lambda (proc string)
               (setq string (concat (process-get proc 'buffer) string))
@@ -58,13 +61,15 @@
                 (set-process-sentinel proc nil)
                 (delete-process proc)
                 (cl-assert (eq (aref string 0) 119)) ; PORT2_RESP
-                (let ((result (aref string 1)))
-                  (funcall
-                   cb (if (/= result 0) (cons 'error result)
-                        (logior (ash (aref string 2) 8) (aref string 3))))))) ; portno
-            :sentinel (lambda (_proc event) (funcall cb (cons 'error event))))))
+                (let* ((result (aref string 1))
+                       (portno (when (= result 0)
+                                 (logior (ash (aref string 2) 8) (aref string 3)))))
+                  (funcall callback portno))))
+            :sentinel (lambda (proc event)
+                        (unless (process-live-p proc) (funcall callback nil))))))
       (process-send-string
-       proc (concat (derl--uint-string 2 (1+ (string-bytes name)))
+       proc (concat (let ((len (1+ (string-bytes name))))
+                      (list (logand #xff (ash -8 len)) (logand #xff len)))
                     [122] ; PORT_PLEASE2_REQ
                     name))
       proc)))
@@ -277,7 +282,7 @@
 (define-error 'normal "Normal exit" 'normal)
 
 (defun derl-self ()
-  "Return a process identifier of the calling process."
+  "Return the process identifier of the calling process."
   `[,derl-tag pid nil ,(derl--process-id derl--self) 0 nil])
 
 (defun derl-make-ref ()
@@ -287,12 +292,14 @@
     `[,derl-tag reference nil ,id nil]))
 
 (defun derl-register (name pid)
+  "Register a symbol NAME with PID in the name registry."
   (pcase pid
     ((and `[,_ pid nil ,id ,_ nil] (guard (gethash id derl--processes)))
      (puthash name id derl--registry))
     (_ (signal 'wrong-type-argument (list pid)))))
 
 (defun derl-whereis (name)
+  "Return the process identifier with the registered NAME, or nil if none exists."
   (when-let ((id (gethash name derl--registry))
              ((gethash id derl--processes)))
     `[,derl-tag pid nil ,id 0 nil]))
@@ -322,6 +329,8 @@
                t)))))
 
 (defun derl-spawn (fun)
+  "Return the process identifier of a new process started by delegating to FUN.
+FUN should be a generator."
   (let* ((id (cl-incf derl--next-pid)) m
          (f (lambda (op value)
               (let ((derl--mailbox m))
@@ -331,6 +340,7 @@
     `[,derl-tag pid nil ,id 0 nil]))
 
 (cl-defmacro derl-yield (&environment env)
+  "Try to give other processes a chance to execute before returning."
   `(progn
      (unless (derl--process-exits derl--self)
        ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--run)))
@@ -504,6 +514,7 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
                   #x80000 ; DFLAG_SEND_SENDER
                   #x1000000 ; DFLAG_HANDSHAKE_23
                   #x2000000 ; DFLAG_UNLINK_ID
+                  (ash 1 36) ; DFLAG_MANDATORY_25_DIGEST
                   (ash 1 33) ; DFLAG_NAME_ME
                   (ash 1 34))))) ; DFLAG_V4_NC
            (name (system-name)))
