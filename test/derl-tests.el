@@ -50,7 +50,7 @@
     (while (gethash pid derl--processes) (derl--run))))
 
 (ert-deftest derl-timeout-test ()
-  (should (eq (derl--call (iter-make (derl-receive (_))) 0) 'timeout)))
+  (should (eq (derl-receive :after 0 'timeout) 'timeout)))
 
 ;; Local Variables:
 ;; read-symbol-shorthands: (("!" . "derl-send"))

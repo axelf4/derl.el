@@ -303,21 +303,25 @@ return the port in a blocking fashion."
   (let ((id (gethash name derl--registry)))
     (and id (gethash id derl--processes) `[,derl-tag pid nil ,id 0 nil])))
 
+(defvar derl--waiting nil)
 (defvar derl--scheduler-timer nil)
-(defun derl--schedule ()
-  (unless derl--scheduler-timer
-    (setq derl--scheduler-timer (run-with-idle-timer 0 nil #'derl--run))))
+(defun derl--schedule (&optional force)
+  (if (and force derl--waiting) (throw 'derl--wake nil)
+    (unless derl--scheduler-timer
+      (setq derl--scheduler-timer (run-with-idle-timer 0 nil #'derl--run)))))
 
 (defun derl--run ()
-  (unless (= (derl--process-id derl--self) 0) (error "Scheduling from inferior process"))
   (setq derl--scheduler-timer nil)
+  (when (/= (derl--process-id derl--self) 0) (error "Scheduling from inferior process"))
   (while (let* ((schedulable
                  (cl-loop for p being the hash-values of derl--processes
                           unless (derl--process-blocked p) collect p))
                 (proc (and schedulable (nth (random (length schedulable)) schedulable))))
            (cond
+            (derl--waiting nil)
             ((null proc) ; Blocked on externalities
-             (unless inhibit-quit (accept-process-output nil 30) t))
+             (let ((derl--waiting t))
+               (catch 'derl--wake (accept-process-output nil 30)) t))
             ((eq proc derl--self) ; Pass control back to main process
              (when (cdr schedulable) (derl--schedule) nil))
             (t (let ((id (derl--process-id proc)) (derl--self proc))
@@ -347,17 +351,29 @@ FUN should be a generator."
 
 (cl-defmacro derl-receive
     (&rest arms &aux (cell (make-symbol "cell")) (prev (make-symbol "prev"))
-           (result (make-symbol "result")) (continue (make-symbol "continue")))
-  "Wait for message matching one of ARMS and proceed with its action."
-  (declare (debug (&rest (pcase-PAT body))))
+           (result (make-symbol "result")) (continue (make-symbol "continue"))
+           (timer (make-symbol "timer")) timeout on-timeout)
+  "Wait for message matching one of ARMS and proceed with its action.
+
+\(fn ARMS... [:after SECS TIMEOUT-FORM])"
+  (declare (debug ([&rest (pcase-PAT body)] &optional [":after" sexp form])))
+  (pcase (last arms 3)
+    (`(:after ,secs ,form) (setq arms (nbutlast arms 3) timeout secs on-timeout form)))
   `(cl-loop
+    ,@(when timeout
+        `(with ,timer initially
+               (let ((f (lambda (p) (setf (derl--process-blocked p) nil ,timer nil)
+                          (derl--schedule t))))
+                 (setq ,timer (run-with-timer ,timeout nil f derl--self)))))
     for ,cell =
     (or (if ,cell (cdr ,cell) derl--mailbox)
-        (cl-letf (((derl--process-blocked derl--self) t))
-          (while (null (derl--process-mailbox derl--self)) (derl-yield))
-          (let ((xs (nreverse (derl--process-mailbox derl--self))))
-            (setf (derl--process-mailbox derl--self) ()
-                  (if ,cell (cdr ,cell) derl--mailbox) xs))))
+        (while (null (derl--process-mailbox derl--self))
+          (cl-letf (((derl--process-blocked derl--self) t))
+            ,@(when timeout `((unless ,timer (cl-return ,on-timeout))))
+            (derl-yield)))
+        (let ((xs (nreverse (derl--process-mailbox derl--self))))
+          (setf (derl--process-mailbox derl--self) ()
+                (if ,cell (cdr ,cell) derl--mailbox) xs)))
     and ,prev = ,cell with ,result while
     (let ((,continue nil))
       (setq ,result ,(let* ((x (gensym "_"))
@@ -365,7 +381,7 @@ FUN should be a generator."
                        (pcase--expand `(car ,cell) `(,@arms (,x (setq ,continue t))))))
       ,continue)
     finally (if ,prev (setcdr ,prev (cdr ,cell)) (pop derl--mailbox))
-    finally return ,result))
+    ,@(when `((when ,timer (cancel-timer ,timer)))) finally return ,result))
 
 (defun derl-send (dest msg)
   "Send MSG to DEST and return MSG.
@@ -556,8 +572,7 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
      (let ((pid (derl-self))) `[,pid [call ,module ,function ,args ,pid]]))
   (derl-receive (`[rex ,x] x)))
 
-;; For simplicity this function may only be called from the main process
-(defun derl--call (fun &optional timeout)
+(cl-defun derl--call (fun &key (timeout 5))
   "Delegate to generator FUN with TIMEOUT, dropping any laggard messages."
   (let* ((self (derl-self))
          (ref (derl-make-ref))
@@ -566,8 +581,9 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
                  (condition-case err (funcall fun op value)
                    (iter-end-of-sequence (! self (cons ref (cdr err)))
                                          (signal (car err) (cdr err))))))))
-    (with-timeout ((or timeout 5) (derl-exit pid 'normal) 'timeout)
-      (derl-receive (`(,(pred (equal ref)) . ,x) x)))))
+    (unwind-protect (derl-receive (`(,(pred (equal ref)) . ,x) x)
+                                  :after timeout 'timeout)
+      (derl-exit pid 'normal))))
 
 (provide 'derl)
 
