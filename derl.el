@@ -345,25 +345,27 @@ FUN should be a generator."
        ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--run)))
      (when-let (x (pop (derl--process-exits derl--self))) (signal x nil))))
 
-(defmacro derl-receive (&rest arms)
+(cl-defmacro derl-receive
+    (&rest arms &aux (cell (make-symbol "cell")) (prev (make-symbol "prev"))
+           (result (make-symbol "result")) (continue (make-symbol "continue")))
   "Wait for message matching one of ARMS and proceed with its action."
   (declare (debug (&rest (pcase-PAT body))))
   `(cl-loop
-    for cell =
-    (or (if cell (cdr cell) derl--mailbox)
+    for ,cell =
+    (or (if ,cell (cdr ,cell) derl--mailbox)
         (cl-letf (((derl--process-blocked derl--self) t))
           (while (null (derl--process-mailbox derl--self)) (derl-yield))
           (let ((xs (nreverse (derl--process-mailbox derl--self))))
-            (setf (derl--process-mailbox derl--self) ())
-            (if cell (setcdr cell xs) (setq derl--mailbox xs)))))
-    and prev = cell with result while
-    (let ((continue nil))
-      (setq result ,(let* ((x (gensym "_"))
-                           (pcase--dontwarn-upats (cons x pcase--dontwarn-upats)))
-                      (pcase--expand '(car cell) `(,@arms (,x (setq continue t))))))
-      continue)
-    finally (if prev (setcdr prev (cdr cell)) (pop derl--mailbox))
-    finally return result))
+            (setf (derl--process-mailbox derl--self) ()
+                  (if ,cell (cdr ,cell) derl--mailbox) xs))))
+    and ,prev = ,cell with ,result while
+    (let ((,continue nil))
+      (setq ,result ,(let* ((x (gensym "_"))
+                            (pcase--dontwarn-upats (cons x pcase--dontwarn-upats)))
+                       (pcase--expand `(car ,cell) `(,@arms (,x (setq ,continue t))))))
+      ,continue)
+    finally (if ,prev (setcdr ,prev (cdr ,cell)) (pop derl--mailbox))
+    finally return ,result))
 
 (defun derl-send (dest msg)
   "Send MSG to DEST and return MSG.
