@@ -175,7 +175,7 @@ return the port in a blocking fashion."
        (write4 (i)
          (insert (logand (ash i -24) #xff) (logand (ash i -16) #xff)
                  (logand (ash i -8) #xff) (logand i #xff))))
-    (pcase term
+    (pcase-exhaustive term
       ((and (pred integerp) i)
        (cond
         ((<= 0 i #xff) (insert 97 i)) ; SMALL_INTEGER_EXT
@@ -250,8 +250,7 @@ return the port in a blocking fashion."
          (if (<= n #xff) (insert 119 n) ; SMALL_ATOM_UTF8_EXT
            (insert 118) ; ATOM_UTF8_EXT
            (write4 n))
-         (forward-char n)))
-      (_ (signal 'wrong-type-argument (list term))))))
+         (forward-char n))))))
 
 ;;; Erlang-like processes
 
@@ -551,13 +550,15 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
     (insert (derl--uint-string 4 (buffer-size)))
     (process-send-region conn (point-min) (point-max))))
 
-(cl-defun derl-cookie (&aux file)
-  (when (or (file-exists-p (setq file "~/.erlang.cookie"))
-            (file-exists-p
-             (setq file (concat (or (getenv "XDG_CONFIG_HOME") "~/.config")
-                                "/erlang/.erlang.cookie"))))
-    (with-temp-buffer (insert-file-contents-literally file)
-                      (buffer-string))))
+(defun derl-cookie ()
+  "Return the default cookie the local node will use, if such exists."
+  (let (file)
+    (when (or (file-exists-p (setq file "~/.erlang.cookie"))
+              (file-exists-p
+               (setq file (concat (or (getenv "XDG_CONFIG_HOME") "~/.config")
+                                  "/erlang/.erlang.cookie"))))
+      (with-temp-buffer (insert-file-contents-literally file)
+                        (buffer-string)))))
 
 (iter-defun derl-rpc (node module function args)
   "Apply FUNCTION in MODULE to ARGS on the remote NODE."
