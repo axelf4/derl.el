@@ -243,22 +243,6 @@ return the port in a blocking fashion."
          (forward-char n)))
       (_ (signal 'wrong-type-argument (list term))))))
 
-(defun derl-binary-to-term (&rest args)
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (apply #'insert args)
-    (goto-char (point-min))
-    (unless (eq (get-byte) derl-ext-version) (error "Bad version"))
-    (forward-char)
-    (derl-read)))
-
-(defun derl-term-to-binary (term)
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (insert derl-ext-version)
-    (derl-write term)
-    (buffer-substring-no-properties (point-min) (point-max))))
-
 ;;; Erlang-like processes
 
 (cl-defstruct (derl--process (:type vector) (:constructor nil)

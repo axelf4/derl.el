@@ -3,6 +3,22 @@
 (require 'ert)
 (require 'derl)
 
+(defun derl-binary-to-term (&rest args)
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (apply #'insert args)
+    (goto-char (point-min))
+    (unless (eq (get-byte) derl-ext-version) (error "Bad version"))
+    (forward-char)
+    (derl-read)))
+
+(defun derl-term-to-binary (term)
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert derl-ext-version)
+    (derl-write term)
+    (buffer-substring-no-properties (point-min) (point-max))))
+
 (ert-deftest derl-gen-digest-test ()
   (should (equal (derl--gen-digest #xb0babeef "kaka")
                  "\327k1\f\326ck'\344\263m\C-F\305P\C-KP")))
