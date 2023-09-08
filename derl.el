@@ -144,7 +144,7 @@ return the port in a blocking fashion."
                 finally return (if (= sign 0) x (- x))))
       (90 ; NEWER_REFERENCE_EXT
        (let ((len (read2)) (node (derl-read)) (creation (read4)) (id 0))
-         (dotimes (_ len) (setq id (logor (ash id 32) (read4))))
+         (dotimes (_ len) (setq id (logior (ash id 32) (read4))))
          (when (internal-p node creation) (setq node nil creation nil))
          `[,derl-tag reference ,node ,id ,creation]))
 
@@ -171,7 +171,8 @@ return the port in a blocking fashion."
 (defun derl-write (term)
   "Print TERM at point according to the Erlang external term format."
   (cl-labels
-      ((write4 (i)
+      ((write2 (i) (insert (logand (ash i -8) #xff) (logand i #xff)))
+       (write4 (i)
          (insert (logand (ash i -24) #xff) (logand (ash i -16) #xff)
                  (logand (ash i -8) #xff) (logand i #xff))))
     (pcase term
@@ -198,6 +199,15 @@ return the port in a blocking fashion."
        (write4 id)
        (write4 serial)
        (write4 creation))
+      (`[,(pred (eq derl-tag)) reference ,node ,id ,creation]
+       (unless node
+         (setq node (process-get derl--write-connection 'name)
+               creation (process-get derl--write-connection 'creation)))
+       (insert 90) ; NEWER_REFERENCE_EXT
+       (cl-loop with xs while (or (> id 0) (null xs)) do
+                (push (logand id #xffffffff) xs) (setq id (ash id -32)) finally
+                (write2 (length xs)) (derl-write node) (write4 creation)
+                (dolist (x xs) (write4 x))))
       ((pred vectorp)
        (if (<= (length term) #xff) (insert 104 (length term)) ; SMALL_TUPLE_EXT
          (insert 105) ; LARGE_TUPLE_EXT
