@@ -556,18 +556,28 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
      (let ((pid (derl-self))) `[,pid [call ,module ,function ,args ,pid]]))
   (derl-receive (`[rex ,x] x)))
 
-(cl-defun derl--call (fun &key (timeout 5))
+(defun derl-do (gen)
+  "Like `iter-yield-from' for contexts callable only from the main process."
+  (iter-do (_ gen) (derl--run)))
+
+(cl-defun derl-call (fun &key (timeout 5))
   "Delegate to generator FUN with TIMEOUT, dropping any laggard messages."
-  (let* ((self (derl-self))
-         (ref (derl-make-ref))
-         (pid (derl-spawn
-               (lambda (op value)
-                 (condition-case err (funcall fun op value)
-                   (iter-end-of-sequence (! self (cons ref (cdr err)))
-                                         (signal (car err) (cdr err))))))))
-    (unwind-protect (derl-receive (`(,(pred (equal ref)) . ,x) x)
-                                  :after timeout 'timeout)
-      (derl-exit pid 'normal))))
+  (iter-make
+   (let* ((self (derl-self))
+          (ref (derl-make-ref))
+          (pid (derl-spawn
+                (lambda (op value)
+                  (condition-case err (funcall fun op value)
+                    (iter-end-of-sequence (! self (cons ref (cdr err)))
+                                          (signal (car err) (cdr err))))))))
+     (condition-case err
+         (derl-receive (`(,(pred (equal ref)) . ,x) x)
+                       :after timeout (progn (derl-exit pid 'normal) 'timeout))
+       (t (derl-exit pid 'normal)
+          (setf derl--mailbox (assoc-delete-all ref derl--mailbox)
+                (derl--process-mailbox derl--self)
+                (assoc-delete-all ref (derl--process-mailbox derl--self)))
+          (signal (car err) (cdr err)))))))
 
 (provide 'derl)
 
