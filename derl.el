@@ -564,7 +564,7 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
   "Apply FUNCTION in MODULE to ARGS on the remote NODE."
   (! `(rex . ,node)
      ;; {Who, {call, M, F, A, GroupLeader}}
-     (let ((pid (derl-self))) `[,pid [call ,module ,function ,args ,pid]]))
+     `[,(derl-self) [call ,module ,function ,args user]])
   (derl-receive (`[rex ,x] x)))
 
 (defun derl-do (gen)
