@@ -60,9 +60,9 @@
     (while (null result) (derl--run))
     (should (equal result '(0 1)))))
 
-(ert-deftest derl-exit-normal-test ()
+(ert-deftest derl-exit-test ()
   (let ((pid (derl-spawn (iter-make (derl-receive (_))))))
-    (derl-exit pid 'normal)
+    (derl-exit pid 'kill)
     (while (gethash pid derl--processes) (derl--run))))
 
 (ert-deftest derl-timeout-test ()

@@ -256,10 +256,10 @@ return the port in a blocking fashion."
 
 (cl-defstruct (derl--process (:type vector) (:constructor nil)
                              (:copier nil) (:predicate nil))
-  (id (:read-only t)) (function (:read-only t)) mailbox blocked exits)
+  (id (:read-only t)) (function (:read-only t)) mailbox blocked)
 
 ;; Process-local variables
-(defvar derl--self [0 nil () nil ()] "The current `derl--process'.")
+(defvar derl--self [0 nil () nil] "The current `derl--process'.")
 (defvar derl--mailbox ()
   "Local chronological order mailbox of the current process.")
 
@@ -271,8 +271,6 @@ return the port in a blocking fashion."
 (defvar derl--registry (make-hash-table :test 'eq) "Process registry.")
 (defvar derl--next-pid 0)
 (defvar derl--next-ref 0)
-
-(define-error 'normal "Normal exit" 'normal)
 
 (defun derl-self ()
   "Return the process identifier of the calling process."
@@ -318,10 +316,11 @@ return the port in a blocking fashion."
             ((eq proc derl--self) ; Pass control back to main process
              (when (cdr schedulable) (derl--schedule) nil))
             (t (let ((id (derl--process-id proc)) (derl--self proc))
-                 (condition-case err (iter-next (derl--process-function proc))
-                   ((iter-end-of-sequence normal) (remhash id derl--processes))
-                   (t (remhash id derl--processes)
-                      (message "Process %d exited with error: %S" id err))))
+                 (condition-case err (funcall (derl--process-function proc) :next nil)
+                   (iter-end-of-sequence (remhash id derl--processes))
+                   (error (remhash id derl--processes)
+                          (message "Process %d exited with error: %S" id err))
+                   (t (remhash id derl--processes) (signal (car err) (cdr err)))))
                t)))))
 
 (defun derl-spawn (fun)
@@ -329,18 +328,14 @@ return the port in a blocking fashion."
 FUN should be a generator."
   (let* ((id (cl-incf derl--next-pid)) m
          (f (lambda (op value)
-              (let ((derl--mailbox m))
-                (unwind-protect (funcall fun op value) (setq m derl--mailbox))))))
+              (let ((derl--mailbox m)) (funcall fun op value) (setq m derl--mailbox)))))
     (puthash id (vector id f () nil ()) derl--processes)
     (derl--schedule)
     `[,derl-tag pid nil ,id 0 nil]))
 
 (cl-defmacro derl-yield (&environment env)
   "Try to give other processes a chance to execute before returning."
-  `(progn
-     (unless (derl--process-exits derl--self)
-       ,(if (assq 'iter-yield env) '(iter-yield nil) '(derl--run)))
-     (when-let (x (pop (derl--process-exits derl--self))) (signal x nil))))
+  (if (assq 'iter-yield env) '(iter-yield nil) '(derl--run)))
 
 (cl-defmacro derl-receive
     (&rest arms &aux (cell (make-symbol "cell")) (prev (make-symbol "prev"))
@@ -406,9 +401,14 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
         (when-let (conn (gethash node derl--connections))
           (derl--send-control-msg conn `[8 ,(derl-self) ,pid ,reason])) ; EXIT2
       (when-let (process (gethash id derl--processes))
-        (push reason (derl--process-exits process))
-        (setf (derl--process-blocked process) nil)
-        (derl--schedule)))))
+        (cond
+         ((and (eq reason 'normal) (not (eq process derl--self))))
+         ((null (derl--process-function process))
+          (message "Main process received exit signal: %S" reason))
+         (t (message "Process %d exited with reason: %S" id reason)
+            (if (eq process derl--self) (signal 'iter-end-of-sequence nil)
+              (remhash id derl--processes)
+              (funcall (derl--process-function process) :close nil))))))))
 
 ;;; Erlang Distribution Protocol
 
@@ -571,24 +571,25 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
   "Like `iter-yield-from' for contexts callable only from the main process."
   (iter-do (_ gen) (derl--run)))
 
-(cl-defun derl-call (fun &key (timeout 5))
+(iter-defun derl-call (fun &optional timeout)
   "Delegate to generator FUN with TIMEOUT, dropping any laggard messages."
-  (iter-make
-   (let* ((self (derl-self))
-          (ref (derl-make-ref))
-          (pid (derl-spawn
-                (lambda (op value)
-                  (condition-case err (funcall fun op value)
-                    (iter-end-of-sequence (! self (cons ref (cdr err)))
-                                          (signal (car err) (cdr err))))))))
-     (condition-case err
-         (derl-receive (`(,(pred (equal ref)) . ,x) x)
-                       :after timeout (progn (derl-exit pid 'normal) 'timeout))
-       (t (derl-exit pid 'normal)
-          (setf derl--mailbox (assoc-delete-all ref derl--mailbox)
-                (derl--process-mailbox derl--self)
-                (assoc-delete-all ref (derl--process-mailbox derl--self)))
-          (signal (car err) (cdr err)))))))
+  (let* ((self (derl-self))
+         (ref (derl-make-ref))
+         (pid (derl-spawn
+               (lambda (op value)
+                 (condition-case err (funcall fun op value)
+                   (iter-end-of-sequence (! self (cons ref (cdr err)))
+                                         (signal (car err) (cdr err)))))))
+         (yielded nil))
+    (unwind-protect
+        (prog1 (derl-receive
+                (`(,(pred (equal ref)) . ,x) x)
+                :after (or timeout 5) (progn (derl-exit pid 'kill) 'timeout))
+          (setq yielded t))
+      (unless yielded
+        (derl-exit pid 'kill)
+        (setf derl--mailbox (assoc-delete-all ref derl--mailbox))
+        (cl-callf2 assoc-delete-all ref (derl--process-mailbox derl--self))))))
 
 (provide 'derl)
 
