@@ -2,16 +2,57 @@
 
 ;; Author: Axel Forsman <axel@axelf.se>
 ;; Keywords: comm, extensions, languages, processes
-;; Version: 0.1.0
+;; Version: 0.1
 ;; Package-Requires: ((emacs "29.1"))
 
 ;;; Commentary:
 
 ;; This library implements the Erlang distribution protocol as
 ;; described in
-;; https://www.erlang.org/doc/apps/erts/erl_dist_protocol.html.
+;; https://www.erlang.org/doc/apps/erts/erl_dist_protocol.html,
+;; allowing Emacs to communicate with Erlang VM:s as if it were
+;; another Erlang node. This is achieved with an Erlang-like process
+;; runtime.
 
-;; Start with "erl -sname arnie"
+;; New processes are created by providing `derl-spawn' with a
+;; generator function (see the `generator' package) to run. Scheduling
+;; is cooperative, not preemptive---processes must voluntarily give
+;; other processes the opportunity to run by calling `derl-yield' or
+;; `derl-receive'. Inter-process communication happens solely through
+;; asynchronous message passing. The following example (which uses "!"
+;; as a shorthand for `derl-send') illustrates spawning a process that
+;; replies once with the number it received plus one:
+
+;;     (let ((pid (derl-spawn
+;;                 (iter-make (derl-receive
+;;                             (`(,from . ,i) (! from (1+ i))))))))
+;;       (! pid (cons (derl-self) 5))
+;;       (derl-receive (i (message "Received %d!" i))))
+
+;; Erlang terms in external term format, see
+;; https://www.erlang.org/doc/apps/erts/erl_ext_dist.html, are
+;; convertible to and from Emacs Lisp terms using the functions
+;; `derl-read' and `derl-write', as per the table below:
+
+;;     Erlang   <=>   Emacs Lisp
+;;     ---------------------------------
+;;     [] / [a | b]   nil / (a . b)
+;;     {a, b}         [a b]
+;;     #{...}         #s(hash-table ...)
+;;     "foo"          (?f ?o ?o)
+;;     <<"foo">>      "foo"
+
+;; In addition, atoms/symbols; integers; and floats are converted to
+;; their respective counterparts, and Erlang process identifiers and
+;; references are translated to opaque ELisp objects. Bitstrings are
+;; not yet supported.
+
+;; If a local Erlang VM was started with e.g. "erl -sname arnie", you
+;; may connect to it and perform an RPC using:
+
+;;     (derl-connect 'local (derl-epmd-port-please "arnie") (derl-cookie))
+;;     (derl-do (derl-call (derl-rpc (intern (concat "arnie@" (system-name)))
+;;                                   'erlang 'node ())))
 
 ;;; Code:
 
@@ -81,7 +122,7 @@ return the port in a blocking fashion."
 ;; version number.
 (defconst derl-ext-version 131 "Erlang external term format version magic.")
 
-(defconst derl-tag (make-symbol "ext-tag")
+(defconst derl-tag (make-symbol "EXT")
   "Marks the encompassing vector as a special Erlang term (i.e. not a tuple).")
 
 (defun derl-read ()
@@ -233,17 +274,17 @@ return the port in a blocking fashion."
        (let* ((exp (frexp term)) (sgnfcand (pop exp))
               (sign (if (>= sgnfcand 0) 0 (setq sgnfcand (- sgnfcand)) (ash 1 31)))
               (bias 1023) e f)
-       (insert 70) ; NEW_FLOAT_EXT
-       (cond
-        ((isnan term) (setq e #x7ff f 1))
-        ((eq sgnfcand 1e+INF) (setq e #x7ff f 0))
-        ((<= exp (- 1 bias)) ; Subnormals
-         (setq e 0 f (floor (ldexp sgnfcand (+ 52 exp (1- bias))))))
-        ;; Ensure significand >= 1 by decrementing exponent
-        (t (setq e (+ bias exp -1)
-                 f (floor (ldexp (1- (* 2 sgnfcand)) 52)))))
-       (write4 (logior sign (ash e 20) (logand (ash f -32) #xfffff)))
-       (write4 (logand f #xffffffff))))
+         (insert 70) ; NEW_FLOAT_EXT
+         (cond
+          ((isnan term) (setq e #x7ff f 1))
+          ((eq sgnfcand 1e+INF) (setq e #x7ff f 0))
+          ((<= exp (- 1 bias)) ; Subnormals
+           (setq e 0 f (floor (ldexp sgnfcand (+ 52 exp (1- bias))))))
+          ;; Ensure significand >= 1 by decrementing exponent
+          (t (setq e (+ bias exp -1)
+                   f (floor (ldexp (1- (* 2 sgnfcand)) 52)))))
+         (write4 (logior sign (ash e 20) (logand (ash f -32) #xfffff)))
+         (write4 (logand f #xffffffff))))
       ((pred symbolp)
        (let ((n (encode-coding-string
                  (symbol-name term) 'utf-8 nil (current-buffer))))
@@ -349,6 +390,7 @@ FUN should be a generator."
     (`(:after ,secs ,form) (setq arms (nbutlast arms 3) timeout secs on-timeout form)))
   `(cl-loop
     ,@(when timeout
+        (cl-assert lexical-binding)
         `(with ,timer initially
                (let ((f (lambda (p) (setf (derl--process-blocked p) nil ,timer nil)
                           (derl--schedule t))))
@@ -383,6 +425,7 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
                        (let ctl `[6 ,(derl-self) nil ,name])) ; REG_SEND
                   (and `[,_ pid ,node ,_ ,_ ,_]
                        (let ctl `[22 ,(derl-self) ,dest]))) ; SEND_SENDER
+              ;; TODO Auto-connect
               (when-let (conn (gethash node derl--connections))
                 (if (and name (eq node (process-get conn 'name)))
                     (gethash name derl--registry)
@@ -420,6 +463,7 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
   (secure-hash 'md5 (concat cookie (number-to-string challenge)) nil nil t))
 
 (defun derl-connect (host port cookie)
+  "Connect to the node at HOST:PORT using COOKIE and return the network process."
   (cl-labels
       ((recv-status (proc)
          (unless (eq (get-byte) ?s) (error "Bad status"))
@@ -431,7 +475,6 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
                   (name (progn (forward-char nlen)
                                (buffer-substring-no-properties (- (point) nlen) (point))))
                   (creation (derl--read-uint 4)))
-             (message "Name: %s, creation: %d" name creation)
              (process-put proc 'name (intern name))
              (process-put proc 'creation creation)
              (process-put proc 'filter #'recv-challenge)))
@@ -463,7 +506,8 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
            (forward-char 17)
            (unless (string= (derl--gen-digest challenge-a cookie) digest)
              (error "Bad digest"))
-           (message "Got challenge ACK!")
+           (message "Connected! (name: %s, creation: %d)"
+                    (process-get proc 'name) (process-get proc 'creation))
            (puthash (process-get proc 'name) proc derl--connections)
            (puthash (process-get proc 'name-b) proc derl--connections)
            (process-put proc 'filter #'connected)))
