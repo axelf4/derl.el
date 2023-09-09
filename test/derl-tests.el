@@ -39,7 +39,7 @@
   (should (equal (derl-term-to-binary 1.1337) "\203F?\362#\242\234w\232k")))
 
 (ert-deftest derl-ext-roundtrip-test ()
-  (let ((x [atom 0.1]))
+  (dolist (x `((0 . "x") [atom 0.1] [,derl-tag nil]))
     (should (equal (derl-binary-to-term (derl-term-to-binary x)) x))))
 
 (ert-deftest derl-reference-unique-test ()

@@ -19,8 +19,8 @@
 ;; is cooperative, not preemptive---processes must voluntarily give
 ;; other processes the opportunity to run by calling `derl-yield' or
 ;; `derl-receive'. Inter-process communication happens solely through
-;; asynchronous message passing. The following example (which uses "!"
-;; as a shorthand for `derl-send') illustrates spawning a process that
+;; asynchronous message passing. The following example (where "!" is a
+;; shorthand for `derl-send') illustrates spawning a process that
 ;; replies once with the number it received plus one:
 
 ;;     (let ((pid (derl-spawn
@@ -37,15 +37,17 @@
 ;;     Erlang   <=>   Emacs Lisp
 ;;     ---------------------------------
 ;;     [] / [a | b]   nil / (a . b)
+;;     nil            [EXT nil]
 ;;     {a, b}         [a b]
 ;;     #{...}         #s(hash-table ...)
 ;;     "foo"          (?f ?o ?o)
 ;;     <<"foo">>      "foo"
 
-;; In addition, atoms/symbols; integers; and floats are converted to
-;; their respective counterparts, and Erlang process identifiers and
-;; references are translated to opaque ELisp objects. Bitstrings are
-;; not yet supported.
+;; where "EXT" denotes the value of `derl-tag'. In addition, integers;
+;; floats; and other atoms/symbols are converted to their respective
+;; counterparts, and Erlang process identifiers and references are
+;; translated to opaque ELisp objects. Bitstrings are not yet
+;; supported.
 
 ;; If a local Erlang VM was started with e.g. "erl -sname arnie", you
 ;; may connect to it and perform an RPC using:
@@ -202,7 +204,8 @@ return the port in a blocking fashion."
       ((or (and 118 (let n (read2))) ; ATOM_UTF8_EXT
            (and 119 (let n (progn (forward-char) (char-before))))) ; SMALL_ATOM_UTF8_EXT
        (forward-char n)
-       (intern (decode-coding-region (- (point) n) (point) 'utf-8 t)))
+       (or (intern (decode-coding-region (- (point) n) (point) 'utf-8 t))
+           `[,derl-tag nil]))
       (tag (error "Unknown tag `%s'" tag)))))
 
 (defvar derl--write-connection)
@@ -249,6 +252,7 @@ return the port in a blocking fashion."
                 (push (logand id #xffffffff) xs) (setq id (ash id -32)) finally
                 (write2 (length xs)) (derl-write node) (write4 creation)
                 (dolist (x xs) (write4 x))))
+      (`[,(pred (eq derl-tag)) nil] (derl-write (eval-when-compile (make-symbol "nil"))))
       ((pred vectorp)
        (if (<= (length term) #xff) (insert 104 (length term)) ; SMALL_TUPLE_EXT
          (insert 105) ; LARGE_TUPLE_EXT
@@ -370,7 +374,7 @@ FUN should be a generator."
   (let* ((id (cl-incf derl--next-pid)) m
          (f (lambda (op value)
               (let ((derl--mailbox m)) (funcall fun op value) (setq m derl--mailbox)))))
-    (puthash id (vector id f () nil ()) derl--processes)
+    (puthash id (vector id f () nil) derl--processes)
     (derl--schedule)
     `[,derl-tag pid nil ,id 0 nil]))
 
@@ -411,7 +415,7 @@ FUN should be a generator."
                        (pcase--expand `(car ,cell) `(,@arms (,x (setq ,continue t))))))
       ,continue)
     finally (if ,prev (setcdr ,prev (cdr ,cell)) (pop derl--mailbox))
-    ,@(when `((when ,timer (cancel-timer ,timer)))) finally return ,result))
+    ,@(when timeout `((when ,timer (cancel-timer ,timer)))) finally return ,result))
 
 (defun derl-send (dest msg)
   "Send MSG to DEST and return MSG.
