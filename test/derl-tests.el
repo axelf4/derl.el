@@ -8,7 +8,7 @@
     (set-buffer-multibyte nil)
     (apply #'insert args)
     (goto-char (point-min))
-    (unless (eq (get-byte) derl-ext-version) (error "Bad version"))
+    (cl-assert (eq (get-byte) derl-ext-version))
     (forward-char)
     (derl-read)))
 
@@ -61,8 +61,14 @@
     (should (equal result '(0 1)))))
 
 (ert-deftest derl-exit-test ()
-  (let ((pid (derl-spawn (iter-make (derl-receive (_))))))
+  (let ((pid (derl-spawn (iter-make (while t (derl-yield))))))
     (derl-exit pid 'kill)
+    (while (gethash pid derl--processes) (derl--run))))
+
+(ert-deftest derl-link-test ()
+  (let ((pid (derl-spawn
+              (iter-make (derl-spawn-link (iter-make (signal 'error nil)))
+                         (while t (derl-yield))))))
     (while (gethash pid derl--processes) (derl--run))))
 
 (ert-deftest derl-timeout-test ()

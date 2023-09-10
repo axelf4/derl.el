@@ -108,7 +108,7 @@ return the port in a blocking fashion."
                        (portno (when (= result 0)
                                  (logior (ash (aref string 2) 8) (aref string 3)))))
                   (funcall callback portno))))
-            :sentinel (lambda (proc event)
+            :sentinel (lambda (proc _event)
                         (unless (process-live-p proc) (funcall callback nil))))))
       (process-send-string
        proc (concat (let ((len (1+ (string-bytes name))))
@@ -126,6 +126,9 @@ return the port in a blocking fashion."
 
 (defconst derl-tag (make-symbol "EXT")
   "Marks the encompassing vector as a special Erlang term (i.e. not a tuple).")
+
+(defvar derl--connections (make-hash-table :test 'eq :weakness 'value)
+  "Map from Erlang node names to connections.")
 
 (defun derl-read ()
   "Read term encoded according to the Erlang external term format following point."
@@ -301,10 +304,11 @@ return the port in a blocking fashion."
 
 (cl-defstruct (derl--process (:type vector) (:constructor nil)
                              (:copier nil) (:predicate nil))
-  (id (:read-only t)) (function (:read-only t)) mailbox blocked)
+  (id (:read-only t)) (function (:read-only t)) mailbox blocked
+  (links (:documentation "List of (PID . UNLINK-ID) pairs for each linked process.")))
 
 ;; Process-local variables
-(defvar derl--self [0 nil () nil] "The current `derl--process'.")
+(defvar derl--self [0 nil () nil ()] "The current `derl--process'.")
 (defvar derl--mailbox ()
   "Local chronological order mailbox of the current process.")
 
@@ -329,10 +333,8 @@ return the port in a blocking fashion."
 
 (defun derl-register (name pid)
   "Register a symbol NAME with PID in the name registry."
-  (pcase-exhaustive pid
-    ((and `[,_ pid nil ,id ,_ nil] (guard (gethash id derl--processes)))
-     (puthash name id derl--registry))
-    ('nil (remhash name derl--registry))))
+  (if (null pid) (remhash name derl--registry)
+    (pcase-let ((`[,_ pid nil ,id ,_ ,_] pid)) (puthash name id derl--registry))))
 
 (defun derl-whereis (name)
   "Return the process identifier with the registered NAME, or nil if none exists."
@@ -348,7 +350,7 @@ return the port in a blocking fashion."
 
 (defun derl--run ()
   (setq derl--scheduler-timer nil)
-  (when (/= (derl--process-id derl--self) 0) (error "Scheduling from inferior process"))
+  (when (derl--process-function derl--self) (error "Scheduling from inferior process"))
   (while (let* ((schedulable
                  (cl-loop for p being the hash-values of derl--processes
                           unless (derl--process-blocked p) collect p))
@@ -362,10 +364,12 @@ return the port in a blocking fashion."
              (when (cdr schedulable) (derl--schedule) nil))
             (t (let ((id (derl--process-id proc)) (derl--self proc))
                  (condition-case err (funcall (derl--process-function proc) :next nil)
-                   (iter-end-of-sequence (remhash id derl--processes))
-                   (error (remhash id derl--processes)
-                          (message "Process %d exited with error: %S" id err))
-                   (t (remhash id derl--processes) (signal (car err) (cdr err)))))
+                   (iter-end-of-sequence (remhash id derl--processes)
+                                         (derl--propagate-exit 'normal))
+                   (t (remhash id derl--processes)
+                      (when (eq (car err) 'derl--exit-signal) (setq err (cdr err)))
+                      (message "Process %d exited with: %S" id err)
+                      (derl--propagate-exit err))))
                t)))))
 
 (defun derl-spawn (fun)
@@ -374,9 +378,13 @@ FUN should be a generator."
   (let* ((id (cl-incf derl--next-pid)) m
          (f (lambda (op value)
               (let ((derl--mailbox m)) (funcall fun op value) (setq m derl--mailbox)))))
-    (puthash id (vector id f () nil) derl--processes)
+    (puthash id (vector id f () nil ()) derl--processes)
     (derl--schedule)
     `[,derl-tag pid nil ,id 0 nil]))
+
+(defun derl-spawn-link (fun)
+  "Like `derl-spawn' but link the calling process and the new process."
+  (let ((pid (derl-spawn fun))) (derl-link pid) pid))
 
 (cl-defmacro derl-yield (&environment env)
   "Try to give other processes a chance to execute before returning."
@@ -423,7 +431,7 @@ DEST can be a remote or local process identifier, a locally registered
 name, or a tuple \(REG-NAME . NODE) for a name at another node."
   (when-let
       ((id (pcase-exhaustive dest
-             (`[,_ pid nil ,id ,_ nil] id)
+             (`[,_ pid nil ,id ,_ ,_] id)
              ((pred symbolp) (gethash dest derl--registry))
              ((or (and `(,name . ,node)
                        (let ctl `[6 ,(derl-self) nil ,name])) ; REG_SEND
@@ -441,26 +449,50 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
     (derl--schedule))
   msg)
 
-(defun derl-exit (pid reason)
-  "Send an exit signal with exit REASON to the process identified by PID."
+(defun derl-exit (pid reason &optional link from)
+  "Send an exit signal with exit REASON to the process identified by PID.
+LINK is non-nil if the exit signal was due to a link."
   (pcase-let ((`[,_ pid ,node ,id ,_ ,_] pid))
     (if node
         (when-let (conn (gethash node derl--connections))
           (derl--send-control-msg conn `[8 ,(derl-self) ,pid ,reason])) ; EXIT2
+      (and (not link) (eq reason 'kill) (setq reason 'killed))
       (when-let (process (gethash id derl--processes))
         (cond
-         ((and (eq reason 'normal) (not (eq process derl--self))))
-         ((null (derl--process-function process))
-          (message "Main process received exit signal: %S" reason))
-         (t (message "Process %d exited with reason: %S" id reason)
-            (if (eq process derl--self) (signal 'iter-end-of-sequence nil)
-              (remhash id derl--processes)
-              (funcall (derl--process-function process) :close nil))))))))
+         ((and link (if-let (x (assoc (or from (derl-self)) (derl--process-links process)))
+                        (cdr x) t)))
+         ((and (eq reason 'normal)
+               (not (if from (equal pid from) (eq process derl--self)))))
+         ((derl--process-function process)
+          (if (eq process derl--self)
+              (signal (if (eq reason 'normal) 'iter-end-of-sequence 'derl--exit-signal)
+                      reason)
+            (remhash id derl--processes)
+            (or (eq reason 'normal) (message "Process %d exited with: %S" id reason))
+            (let ((derl--self process))
+              (unwind-protect (funcall (derl--process-function process) :close nil)
+                (derl--propagate-exit reason)))))
+         ((eq reason 'normal) (signal 'quit nil))
+         ((eq reason 'killed) (kill-emacs))
+         (t (message "Main process received exit signal: %S" reason)))))))
+
+(defun derl--propagate-exit (reason)
+  (pcase-dolist (`(,pid . ,unlink-id) (derl--process-links derl--self))
+    (unless unlink-id (derl-exit pid reason t))))
+
+(defun derl-link (pid)
+  "Set up a link between the calling process and another process identified by PID."
+  (when (if-let (link (assoc pid (derl--process-links derl--self)))
+            (prog1 (cdr link) (setcdr link nil)) ; Clear outstanding unlink id
+          (push (list pid) (derl--process-links derl--self)))
+    (pcase-let ((`[,_ pid ,node ,id ,_ ,_] pid))
+      (if node (when-let (conn (gethash node derl--connections))
+                 (derl--send-control-msg conn `[1 ,(derl-self) ,pid])) ; LINK
+        (when-let (process (gethash id derl--processes))
+          ;; Unlinking would have been atomic for internal processes
+          (push (list (derl-self)) (derl--process-links process)))))))
 
 ;;; Erlang Distribution Protocol
-
-(defvar derl--connections (make-hash-table :test 'eq :weakness 'value)
-  "Map from Erlang node names to connections.")
 
 (defun derl--gen-digest (challenge cookie)
   "Generate a message digest (the \"gen_digest()\" function)."
@@ -528,10 +560,24 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
                         (forward-char)
                         (derl-read))))
              (message "Parsed: %S" (cons ctl msg))
-             (pcase ctl
+             (pcase-exhaustive ctl
+               (`[1 ,from [,_ pid nil ,to ,_ ,_]] ; LINK
+                (when-let ((process (gethash to derl--processes))
+                           ((null (assoc from (derl--process-links process)))))
+                  (push (list from) (derl--process-links process))))
                (`[22 ,_from ,to] (! to msg)) ; SEND_SENDER
-               (`[,(or 3 8) ,from ,to ,reason] (derl-exit to reason)) ; EXIT/EXIT2
-               (`[6 ,_from ,_ ,to] (! to msg)))))) ; REG_SEND
+               (`[,(or (and 3 (let link t)) 8) ,from ,to ,reason] ; EXIT/EXIT2
+                (derl-exit to reason link from))
+               (`[6 ,_from ,_ ,to] (! to msg)) ; REG_SEND
+               (`[35 ,id ,from ,(and to `[,_ pid nil ,to-id ,_ ,_])] ; UNLINK_ID
+                (when-let ((process (gethash to-id derl--processes))
+                           (link (assoc from (derl--process-links process)))
+                           ((null (cdr link)))) ; No outstanding unlink operation
+                  (cl-callf2 assoc-delete-all from (derl--process-links process)))
+                (derl--send-control-msg proc `[36 ,id ,to ,from])) ; UNLINK_ID_ACC
+               (`[36 ,id ,from [,_ pid nil ,to-id ,_ ,_]] ; UNLINK_ID_ACC
+                (when-let ((process (gethash to-id derl--processes)))
+                  (cl-callf2 delete (cons from id) (derl--process-links process))))))))
        (filter (proc string)
          (with-current-buffer (process-buffer proc)
            (insert string)
