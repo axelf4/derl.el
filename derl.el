@@ -492,6 +492,19 @@ LINK is non-nil if the exit signal was due to a link."
           ;; Unlinking would have been atomic for internal processes
           (push (list (derl-self)) (derl--process-links process)))))))
 
+(defun derl-unlink (pid)
+  "Remove a link between the calling process and another process identified by PID."
+  (pcase-let ((`[,_ pid ,node ,id ,_ ,_] pid))
+    (if node
+        (when-let ((link (assoc pid (derl--process-links derl--self)))
+                   ((null (cdr link)))
+                   (conn (gethash node derl--connections)))
+          (let ((unlink-id (setcdr link (1+ (random (1- (ash 1 64)))))))
+            (derl--send-control-msg conn `[35 ,unlink-id ,(derl-self) ,pid]))) ; UNLINK_ID
+      (cl-callf2 assoc-delete-all pid (derl--process-links derl--self))
+      (when-let (process (gethash id derl--processes))
+        (cl-callf2 assoc-delete-all (derl-self) (derl--process-links process))))))
+
 ;;; Erlang Distribution Protocol
 
 (defun derl--gen-digest (challenge cookie)
