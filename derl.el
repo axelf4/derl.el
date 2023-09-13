@@ -52,7 +52,6 @@
 ;; If a local Erlang VM was started with e.g. "erl -sname arnie", you
 ;; may connect to it and perform an RPC using:
 
-;;     (derl-connect 'local (derl-epmd-port-please "arnie") (derl-cookie))
 ;;     (derl-do (derl-call (derl-rpc (intern (concat "arnie@" (system-name)))
 ;;                                   'erlang 'node ())))
 
@@ -67,11 +66,7 @@
     "Read N-byte network-endian unsigned integer."
     (cl-loop
      for i below n collect
-     (let ((x `(get-byte ,(cl-case i
-                            (0 'p)
-                            (1 `(1+ p))
-                            (t `(+ p ,i))))))
-       (if (< i (1- n)) `(ash ,x ,(* 8 (- n i 1))) x))
+     (let ((x `(get-byte (+ p ,i)))) (if (< i (1- n)) `(ash ,x ,(* 8 (- n i 1))) x))
      into xs finally return `(let ((p (point))) (forward-char ,n) (logior ,@xs))))
 
   (defmacro derl--uint-string (n integer)
@@ -83,19 +78,19 @@
 
 ;;; Erlang Port Mapper Daemon (EPMD) interaction
 
-(defun derl-epmd-port-please (name &optional callback)
-  "Get the distribution port of the node NAME.
+(defun derl-epmd-port-please (name host &optional callback)
+  "Get the distribution port of the node NAME@HOST.
 If non-nil CALLBACK, return the network process and call CALLBACK
 asynchronously with the port, nil indicating an error. Otherwise,
 return the port in a blocking fashion."
   (if (null callback)
       (let* (result
-             (proc (derl-epmd-port-please name (lambda (x) (setq result x)))))
+             (proc (derl-epmd-port-please name host (lambda (x) (setq result x)))))
         (while (accept-process-output proc))
         result)
     (let ((proc
            (make-network-process
-            :name "epmd-port-please-req" :host 'local :service 4369
+            :name "epmd-port-please-req" :host host :service 4369
             :plist (list 'buffer "") :coding 'binary :filter
             (lambda (proc string)
               (setq string (concat (process-get proc 'buffer) string))
@@ -134,8 +129,7 @@ return the port in a blocking fashion."
   "Read term encoded according to the Erlang external term format following point."
   (when (eq (char-after) 80) ; Compressed term
     (delete-char 5) ; Skip tag and uncompressed size
-    (unless (zlib-decompress-region (point) (point-max))
-      (error "Failed to decompress term")))
+    (or (zlib-decompress-region (point) (point-max)) (signal 'compression-error ())))
   (cl-labels
       ((read2 ()
          (forward-char 2)
@@ -437,12 +431,10 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
                        (let ctl `[6 ,(derl-self) nil ,name])) ; REG_SEND
                   (and `[,_ pid ,node ,_ ,_ ,_]
                        (let ctl `[22 ,(derl-self) ,dest]))) ; SEND_SENDER
-              ;; TODO Auto-connect
-              (when-let (conn (gethash node derl--connections))
+              (when-let (conn (derl--ensure-connection node))
                 (if (and name (eq node (process-get conn 'name)))
                     (gethash name derl--registry)
-                  (derl--send-control-msg conn ctl msg)
-                  nil)))))
+                  (derl--send-control-msg conn ctl msg) nil)))))
        (process (gethash id derl--processes)))
     (push msg (derl--process-mailbox process))
     (setf (derl--process-blocked process) nil)
@@ -453,10 +445,8 @@ name, or a tuple \(REG-NAME . NODE) for a name at another node."
   "Send an exit signal with exit REASON to the process identified by PID.
 LINK is non-nil if the exit signal was due to a link."
   (pcase-let ((`[,_ pid ,node ,id ,_ ,_] pid))
-    (if node
-        (when-let (conn (gethash node derl--connections))
-          (derl--send-control-msg conn `[8 ,(derl-self) ,pid ,reason])) ; EXIT2
-      (and (not link) (eq reason 'kill) (setq reason 'killed))
+    (if node (when-let (conn (derl--ensure-connection node))
+               (derl--send-control-msg conn `[8 ,(derl-self) ,pid ,reason])) ; EXIT2
       (when-let (process (gethash id derl--processes))
         (cond
          ((and link (if-let (x (assoc (or from (derl-self)) (derl--process-links process)))
@@ -468,12 +458,13 @@ LINK is non-nil if the exit signal was due to a link."
               (signal (if (eq reason 'normal) 'iter-end-of-sequence 'derl--exit-signal)
                       reason)
             (remhash id derl--processes)
+            (and (not link) (eq reason 'kill) (setq reason 'killed))
             (or (eq reason 'normal) (message "Process %d exited with: %S" id reason))
             (let ((derl--self process))
               (unwind-protect (funcall (derl--process-function process) :close nil)
                 (derl--propagate-exit reason)))))
          ((eq reason 'normal) (signal 'quit nil))
-         ((eq reason 'killed) (kill-emacs))
+         ((and (not link) (eq reason 'kill)) (kill-emacs))
          (t (message "Main process received exit signal: %S" reason)))))))
 
 (defun derl--propagate-exit (reason)
@@ -486,7 +477,7 @@ LINK is non-nil if the exit signal was due to a link."
             (prog1 (cdr link) (setcdr link nil)) ; Clear outstanding unlink id
           (push (list pid) (derl--process-links derl--self)))
     (pcase-let ((`[,_ pid ,node ,id ,_ ,_] pid))
-      (if node (when-let (conn (gethash node derl--connections))
+      (if node (when-let (conn (derl--ensure-connection node))
                  (derl--send-control-msg conn `[1 ,(derl-self) ,pid])) ; LINK
         (when-let (process (gethash id derl--processes))
           ;; Unlinking would have been atomic for internal processes
@@ -496,9 +487,8 @@ LINK is non-nil if the exit signal was due to a link."
   "Remove a link between the calling process and another process identified by PID."
   (pcase-let ((`[,_ pid ,node ,id ,_ ,_] pid))
     (if node
-        (when-let ((link (assoc pid (derl--process-links derl--self)))
-                   ((null (cdr link)))
-                   (conn (gethash node derl--connections)))
+        (when-let ((link (assoc pid (derl--process-links derl--self))) ((null (cdr link)))
+                   (conn (derl--ensure-connection node)))
           (let ((unlink-id (setcdr link (1+ (random (1- (ash 1 64)))))))
             (derl--send-control-msg conn `[35 ,unlink-id ,(derl-self) ,pid]))) ; UNLINK_ID
       (cl-callf2 assoc-delete-all pid (derl--process-links derl--self))
@@ -511,26 +501,26 @@ LINK is non-nil if the exit signal was due to a link."
   "Generate a message digest (the \"gen_digest()\" function)."
   (secure-hash 'md5 (concat cookie (number-to-string challenge)) nil nil t))
 
-(defun derl-connect (host port cookie)
+(cl-defun derl-connect (host port cookie &key callback)
   "Connect to the node at HOST:PORT using COOKIE and return the network process."
   (cl-labels
-      ((recv-status (proc)
-         (unless (eq (get-byte) ?s) (error "Bad status"))
+      ((err (proc msg) (delete-process proc) (error "%s" msg))
+       (recv-status (proc)
+         (unless (eq (get-byte) ?s) (err "Bad status"))
          (forward-char)
          (cond
-          ((looking-at-p "named:")
-           (forward-char 6)
+          ((looking-at-p "named:") (forward-char 6)
            (let* ((nlen (derl--read-uint 2))
                   (name (progn (forward-char nlen)
                                (buffer-substring-no-properties (- (point) nlen) (point))))
                   (creation (derl--read-uint 4)))
-             (process-put proc 'name (intern name))
-             (process-put proc 'creation creation)
-             (process-put proc 'filter #'recv-challenge)))
+             (set-process-plist
+              proc (nconc (list 'name (intern name) 'creation creation)
+                          (plist-put (process-plist proc) 'filter #'recv-challenge)))))
           ;; TODO alive and case 3B)
-          (t (error "Unknown status"))))
+          (t (err "Unknown status"))))
        (recv-challenge (proc)
-         (cl-assert (eq (get-byte) ?N)) ; recv_challenge_reply tag
+         (unless (eq (get-byte) ?N) (err "Bad challenge")) ; recv_challenge_reply tag
          (forward-char 9)
          (let* ((challenge-b (derl--read-uint 4))
                 (creation-b (derl--read-uint 4))
@@ -539,37 +529,38 @@ LINK is non-nil if the exit signal was due to a link."
                                (buffer-substring-no-properties (- (point) nlen) (point))))
                 (challenge-a (random (ash 1 32))) ; #x100000000
                 (digest (derl--gen-digest challenge-b cookie)))
-           (process-put proc 'name-b (intern name-b))
-           (process-put proc 'creation-b creation-b)
-           (process-put proc 'challenge-a challenge-a)
+           (set-process-plist
+            proc (nconc (list 'name-b (intern name-b) 'creation-b creation-b
+                              'challenge-a challenge-a)
+                        (plist-put (process-plist proc) 'filter #'recv-challenge-ack)))
            (process-send-string
             proc (concat [0 21 ; Length
                             ?r] ; send_challenge_reply tag
                          (derl--uint-string 4 challenge-a)
-                         digest))
-           (process-put proc 'filter #'recv-challenge-ack)))
+                         digest))))
        (recv-challenge-ack (proc)
-         (unless (eq (get-byte) ?a) (error "Bad tag"))
+         (unless (eq (get-byte) ?a) (err "Bad tag"))
          (let ((challenge-a (process-get proc 'challenge-a))
                (digest (buffer-substring-no-properties (1+ (point)) (+ (point) 1 16))))
            (forward-char 17)
            (unless (string= (derl--gen-digest challenge-a cookie) digest)
-             (error "Bad digest"))
+             (err "Bad digest"))
            (message "Connected! (name: %s, creation: %d)"
                     (process-get proc 'name) (process-get proc 'creation))
            (puthash (process-get proc 'name) proc derl--connections)
            (puthash (process-get proc 'name-b) proc derl--connections)
-           (process-put proc 'filter #'connected)))
+           (process-put proc 'filter #'connected)
+           (when callback (funcall callback t) (setq callback nil))))
        (connected (proc)
          (if (= (point-min) (point-max))
              (process-send-string proc "\0\0\0\0") ; Zero-length heartbeat
-           (cl-assert (eq (get-byte) 112)) ; Check that type is pass through
+           (unless (eq (get-byte) 112) (err "Type is not pass through"))
            (forward-char)
-           (let ((ctl (progn (cl-assert (eq (get-byte) derl-ext-version))
+           (let ((ctl (progn (or (eq (get-byte) derl-ext-version) (err "Bad version"))
                              (forward-char)
                              (derl-read)))
                  (msg (unless (eobp)
-                        (cl-assert (eq (get-byte) derl-ext-version))
+                        (or (eq (get-byte) derl-ext-version) (err "Bad version"))
                         (forward-char)
                         (derl-read))))
              (message "Parsed: %S" (cons ctl msg))
@@ -604,16 +595,21 @@ LINK is non-nil if the exit signal was due to a link."
                (save-restriction
                  (narrow-to-region (point) (+ (point-min) len))
                  (funcall (process-get proc 'filter) proc)
-                 (when (< (point) (point-max)) (error "Bad length")))
+                 (when (< (point) (point-max)) (err "Bad length")))
                (delete-region (point-min) (point))))
            (goto-char (point-max))))
        (sentinel (proc _event)
-         (unless (process-live-p proc) (kill-buffer (process-buffer proc)))))
-    (let* ((buf (generate-new-buffer " *erl recv*" t))
+         (unless (process-live-p proc)
+           (kill-buffer (process-buffer proc))
+           (when-let (name (process-get proc 'name))
+             (remhash name derl--connections)
+             (remhash (process-get proc 'name-b) derl--connections))
+           (when callback (funcall callback nil)))))
+    (let* ((buf (generate-new-buffer " *derl recv*" t))
            (proc (make-network-process
-                  :name "erl-emacs" :buffer buf :host host :service port
+                  :name (format "derl-%s:%s" host port) :host host :service port
                   :coding 'binary :filter #'filter :sentinel #'sentinel
-                  :plist (list 'filter #'recv-status)))
+                  :buffer buf :plist (list 'filter #'recv-status)))
            (flags
             (eval-when-compile
               (derl--uint-string
@@ -645,6 +641,21 @@ LINK is non-nil if the exit signal was due to a link."
                     (derl--uint-string 2 (string-bytes name)) ; Nlen
                     name))
       proc)))
+
+(defun derl--ensure-connection (node)
+  "Block until a connection to NODE is established and return the network process."
+  (if-let (conn (gethash node derl--connections)) conn
+    (message "Connecting to `%s'..." node)
+    (let* ((node-string (symbol-name node))
+           (name (if (string-match "\\`\\([^@]+\\)@\\([^@]+\\)\\'" node-string)
+                     (match-string 1 node-string) (error "Invalid node `%s'" node)))
+           (host (match-string 2 node-string))
+           result donep
+           (callback (lambda (successp) (setq result successp donep t)))
+           (proc (derl-connect host (derl-epmd-port-please name host) (derl-cookie)
+                               :callback callback)))
+      (while (and (accept-process-output proc 1) (not donep)))
+      (when result proc))))
 
 (defun derl--send-control-msg (conn control-msg &optional msg)
   (with-temp-buffer
