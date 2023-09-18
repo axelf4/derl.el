@@ -1,14 +1,15 @@
 # derl
 
-Derl is an Emacs Lisp library for communicating with Erlang nodes.
+Derl is an Emacs Lisp library for communicating with Erlang nodes,
+that provides an Erlang-like process concurrency abstraction.
 In other words, it is full rewrite of the library part of [Distel],
 differing in the following ways:
 
 * Processes run generator functions defined via the `generator` package,
-  meaning they do not have to be written manually in trampolined style.
+  meaning they do not have to be manually written in trampolined style.
 
-  This makes `receive` expressions way easier to write
-  since one does not have to manually specify the `saved-vars` argument.
+  This makes `receive` expressions easier to write
+  since the `saved-vars` argument becomes unnecessary.
 * Pattern matching for `receive` expressions uses `pcase` patterns,
   instead of a bespoke syntax.
 * Processes are not backed by Emacs buffers.

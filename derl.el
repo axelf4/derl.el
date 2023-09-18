@@ -46,8 +46,8 @@
 ;; where "EXT" denotes the value of `derl-tag'. In addition, integers;
 ;; floats; and other atoms/symbols are converted to their respective
 ;; counterparts, and Erlang process identifiers and references are
-;; translated to opaque ELisp objects. Bitstrings are not yet
-;; supported.
+;; translated to opaque ELisp objects. Bitstrings and ports are not
+;; yet supported.
 
 ;; If a local Erlang VM was started with e.g. "erl -sname arnie", you
 ;; may connect to it and perform an RPC using:
@@ -66,7 +66,7 @@
     "Read N-byte network-endian unsigned integer."
     (cl-loop
      for i below n collect
-     (let ((x `(get-byte (+ p ,i)))) (if (< i (1- n)) `(ash ,x ,(* 8 (- n i 1))) x))
+     (let ((x `(char-after (+ p ,i))) (j (* 8 (- n i 1)))) (if (= j 0) x `(ash ,x ,j)))
      into xs finally return `(let ((p (point))) (forward-char ,n) (logior ,@xs))))
 
   (defmacro derl--uint-string (n integer)
@@ -131,14 +131,8 @@ return the port in a blocking fashion."
     (delete-char 5) ; Skip tag and uncompressed size
     (or (zlib-decompress-region (point) (point-max)) (signal 'compression-error ())))
   (cl-labels
-      ((read2 ()
-         (forward-char 2)
-         (logior (ash (char-before (1- (point))) 8) (char-before)))
-       (read4 ()
-         (let ((p (point)))
-           (forward-char 4)
-           (logior (ash (get-byte p) 24) (ash (get-byte (1+ p)) 16)
-                   (ash (get-byte (+ p 2)) 8) (get-byte (+ p 3)))))
+      ((read2 () (derl--read-uint 2))
+       (read4 () (derl--read-uint 4))
        (internal-p (node creation)
          (let ((conn (gethash node derl--connections)))
            (and (eq node (process-get conn 'name))
@@ -160,7 +154,6 @@ return the port in a blocking fashion."
            (and 105 (let n (read4)))) ; LARGE_TUPLE_EXT
        (cl-loop repeat n collect (derl-read) into xs
                 finally return (apply #'vector xs)))
-
       (116 ; MAP_EXT
        (cl-loop with n = (read4) with x = (make-hash-table :test 'equal :size n)
                 repeat n do (puthash (derl-read) (derl-read) x) finally return x))
@@ -179,7 +172,7 @@ return the port in a blocking fashion."
            (and 111 (let n (read4)))) ; LARGE_BIG_EXT
        (cl-loop with sign = (progn (forward-char) (char-before)) and x = 0
                 for i below n do
-                (setq x (logior x (ash (get-byte) (ash i 1))))
+                (setq x (logior x (ash (char-after) (ash i 1))))
                 (forward-char)
                 finally return (if (= sign 0) x (- x))))
       (90 ; NEWER_REFERENCE_EXT
@@ -389,9 +382,11 @@ FUN should be a generator."
            (result (make-symbol "result")) (continue (make-symbol "continue"))
            (timer (make-symbol "timer")) timeout on-timeout)
   "Wait for message matching one of ARMS and proceed with its action.
+With the `:after' keyword, if no matching message has arrived within
+SECS, then TIMEOUT-FORM is evaluated instead.
 
 \(fn ARMS... [:after SECS TIMEOUT-FORM])"
-  (declare (debug ([&rest (pcase-PAT body)] &optional [":after" sexp form])))
+  (declare (debug ([&rest (pcase-PAT body)] &optional [":after" form form])))
   (pcase (last arms 3)
     (`(:after ,secs ,form) (setq arms (nbutlast arms 3) timeout secs on-timeout form)))
   `(cl-loop
@@ -502,11 +497,13 @@ LINK is non-nil if the exit signal was due to a link."
   (secure-hash 'md5 (concat cookie (number-to-string challenge)) nil nil t))
 
 (cl-defun derl-connect (host port cookie &key callback)
-  "Connect to the node at HOST:PORT using COOKIE and return the network process."
+  "Connect to the node at HOST:PORT using COOKIE and return the network process.
+Non-nil unary CALLBACK will be called once after the connection
+handshake with a non-nil argument indicating success."
   (cl-labels
       ((err (proc msg) (delete-process proc) (error "%s" msg))
        (recv-status (proc)
-         (unless (eq (get-byte) ?s) (err "Bad status"))
+         (unless (eq (char-after) ?s) (err "Bad status"))
          (forward-char)
          (cond
           ((looking-at-p "named:") (forward-char 6)
@@ -520,7 +517,7 @@ LINK is non-nil if the exit signal was due to a link."
           ;; TODO alive and case 3B)
           (t (err "Unknown status"))))
        (recv-challenge (proc)
-         (unless (eq (get-byte) ?N) (err "Bad challenge")) ; recv_challenge_reply tag
+         (unless (eq (char-after) ?N) (err "Bad challenge")) ; recv_challenge_reply tag
          (forward-char 9)
          (let* ((challenge-b (derl--read-uint 4))
                 (creation-b (derl--read-uint 4))
@@ -539,7 +536,7 @@ LINK is non-nil if the exit signal was due to a link."
                          (derl--uint-string 4 challenge-a)
                          digest))))
        (recv-challenge-ack (proc)
-         (unless (eq (get-byte) ?a) (err "Bad tag"))
+         (unless (eq (char-after) ?a) (err "Bad tag"))
          (let ((challenge-a (process-get proc 'challenge-a))
                (digest (buffer-substring-no-properties (1+ (point)) (+ (point) 1 16))))
            (forward-char 17)
@@ -550,20 +547,19 @@ LINK is non-nil if the exit signal was due to a link."
            (puthash (process-get proc 'name) proc derl--connections)
            (puthash (process-get proc 'name-b) proc derl--connections)
            (process-put proc 'filter #'connected)
-           (when callback (funcall callback t) (setq callback nil))))
+           (when callback (funcall callback proc) (setq callback nil))))
        (connected (proc)
          (if (= (point-min) (point-max))
              (process-send-string proc "\0\0\0\0") ; Zero-length heartbeat
-           (unless (eq (get-byte) 112) (err "Type is not pass through"))
+           (unless (eq (char-after) 112) (err "Type is not pass through"))
            (forward-char)
-           (let ((ctl (progn (or (eq (get-byte) derl-ext-version) (err "Bad version"))
+           (let ((ctl (progn (or (eq (char-after) derl-ext-version) (err "Bad version"))
                              (forward-char)
                              (derl-read)))
                  (msg (unless (eobp)
-                        (or (eq (get-byte) derl-ext-version) (err "Bad version"))
+                        (or (eq (char-after) derl-ext-version) (err "Bad version"))
                         (forward-char)
                         (derl-read))))
-             (message "Parsed: %S" (cons ctl msg))
              (pcase-exhaustive ctl
                (`[1 ,from [,_ pid nil ,to ,_ ,_]] ; LINK
                 (when-let ((process (gethash to derl--processes))
@@ -706,7 +702,6 @@ LINK is non-nil if the exit signal was due to a link."
           (setq yielded t))
       (unless yielded
         (derl-exit pid 'kill)
-        (setf derl--mailbox (assoc-delete-all ref derl--mailbox))
         (cl-callf2 assoc-delete-all ref (derl--process-mailbox derl--self))))))
 
 (provide 'derl)
