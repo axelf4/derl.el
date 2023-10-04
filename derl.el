@@ -289,7 +289,7 @@ return the port in a blocking fashion."
          (insert 70) ; NEW_FLOAT_EXT
          (cond
           ((isnan term) (setq e #x7ff f 1))
-          ((eq sgnfcand 1e+INF) (setq e #x7ff f 0))
+          ((= sgnfcand 1e+INF) (setq e #x7ff f 0))
           ((<= exp (- 1 bias)) ; Subnormals
            (setq e 0 f (floor (ldexp sgnfcand (+ 52 exp (1- bias))))))
           ;; Ensure significand >= 1 by decrementing exponent
